@@ -8,6 +8,9 @@ import {
   type RuntimeMap,
   type Language,
 } from "./runtime.js";
+import { smartTruncate } from "@context-mode/shared/truncate";
+export type { ExecResult } from "@context-mode/shared/types";
+import type { ExecResult } from "@context-mode/shared/types";
 
 const isWin = process.platform === "win32";
 
@@ -20,13 +23,6 @@ function killTree(proc: ReturnType<typeof spawn>): void {
   } else {
     proc.kill("SIGKILL");
   }
-}
-
-export interface ExecResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  timedOut: boolean;
 }
 
 interface ExecuteOptions {
@@ -170,50 +166,6 @@ export class PolyglotExecutor {
     return this.#spawn([binPath], cwd, timeout);
   }
 
-  /**
-   * Smart truncation: keeps head (60%) + tail (40%) of output,
-   * preserving both initial context and final error messages.
-   * Snaps to line boundaries and handles UTF-8 safely.
-   */
-  static #smartTruncate(raw: string, max: number): string {
-    if (Buffer.byteLength(raw) <= max) return raw;
-
-    const lines = raw.split("\n");
-
-    // Budget: 60% head, 40% tail (errors/results are usually at the end)
-    const headBudget = Math.floor(max * 0.6);
-    const tailBudget = max - headBudget;
-
-    // Collect head lines
-    const headLines: string[] = [];
-    let headBytes = 0;
-    for (const line of lines) {
-      const lineBytes = Buffer.byteLength(line) + 1; // +1 for \n
-      if (headBytes + lineBytes > headBudget) break;
-      headLines.push(line);
-      headBytes += lineBytes;
-    }
-
-    // Collect tail lines (from end)
-    const tailLines: string[] = [];
-    let tailBytes = 0;
-    for (let i = lines.length - 1; i >= headLines.length; i--) {
-      const lineBytes = Buffer.byteLength(lines[i]) + 1;
-      if (tailBytes + lineBytes > tailBudget) break;
-      tailLines.unshift(lines[i]);
-      tailBytes += lineBytes;
-    }
-
-    const skippedLines =
-      lines.length - headLines.length - tailLines.length;
-    const skippedBytes =
-      Buffer.byteLength(raw) - headBytes - tailBytes;
-
-    const separator = `\n\n... [${skippedLines} lines / ${(skippedBytes / 1024).toFixed(1)}KB truncated — showing first ${headLines.length} + last ${tailLines.length} lines] ...\n\n`;
-
-    return headLines.join("\n") + separator + tailLines.join("\n");
-  }
-
   async #spawn(
     cmd: string[],
     cwd: string,
@@ -290,8 +242,8 @@ export class PolyglotExecutor {
         }
 
         const max = this.#maxOutputBytes;
-        const stdout = PolyglotExecutor.#smartTruncate(rawStdout, max);
-        const stderr = PolyglotExecutor.#smartTruncate(rawStderr, max);
+        const stdout = smartTruncate(rawStdout, max);
+        const stderr = smartTruncate(rawStderr, max);
 
         res({
           stdout,

@@ -45,20 +45,14 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Typecheck (core)
-        run: npx tsc --noEmit
+      - name: Typecheck
+        run: npx tsc -b --noEmit
 
-      - name: Build (core)
+      - name: Build
         run: npm run build
-
-      - name: Build (session packages)
-        run: npx tsc -b packages/session/tsconfig.json
-
-      - name: Typecheck (session)
-        run: npx tsc -b packages/session/tsconfig.json --noEmit
 
       - name: Run all tests
         run: npm test
 
       - name: Doctor (verify server starts)
-        run: npx tsx src/cli.ts doctor
+        run: npx tsx packages/core/src/cli.ts doctor

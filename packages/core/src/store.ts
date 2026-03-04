@@ -8,34 +8,12 @@
  * you need EXACT text later — not summaries.
  */
 
-import type DatabaseConstructor from "better-sqlite3";
 import type { Database as DatabaseInstance } from "better-sqlite3";
-
-// better-sqlite3's `Statement` generic collapses under `ReturnType` to a
-// single-param signature. Use an explicit interface for cached statements
-// that accept varying parameter counts.
-interface PreparedStatement {
-  run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint };
-  get(...params: unknown[]): unknown;
-  all(...params: unknown[]): unknown[];
-  iterate(...params: unknown[]): IterableIterator<unknown>;
-}
-import { createRequire } from "node:module";
+import { loadDatabase, applyWALPragmas } from "@context-mode/shared/db-base";
+import type { PreparedStatement } from "@context-mode/shared/db-base";
 import { readFileSync, readdirSync, unlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-// Lazy-load better-sqlite3 — only when ContentStore is first used.
-// This lets the MCP server start instantly even if the native module
-// isn't installed yet (marketplace first-run scenario).
-let _Database: typeof DatabaseConstructor | null = null;
-function loadDatabase(): typeof DatabaseConstructor {
-  if (!_Database) {
-    const require = createRequire(import.meta.url);
-    _Database = require("better-sqlite3") as typeof DatabaseConstructor;
-  }
-  return _Database;
-}
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -47,28 +25,8 @@ interface Chunk {
   hasCode: boolean;
 }
 
-export interface IndexResult {
-  sourceId: number;
-  label: string;
-  totalChunks: number;
-  codeChunks: number;
-}
-
-export interface SearchResult {
-  title: string;
-  content: string;
-  source: string;
-  rank: number;
-  contentType: "code" | "prose";
-  matchLayer?: "porter" | "trigram" | "fuzzy";
-  highlighted?: string;
-}
-
-export interface StoreStats {
-  sources: number;
-  chunks: number;
-  codeChunks: number;
-}
+import type { IndexResult, SearchResult, StoreStats } from "@context-mode/shared/types";
+export type { IndexResult, SearchResult, StoreStats } from "@context-mode/shared/types";
 
 // ─────────────────────────────────────────────────────────
 // Constants
@@ -209,8 +167,7 @@ export class ContentStore {
     this.#dbPath =
       dbPath ?? join(tmpdir(), `context-mode-${process.pid}.db`);
     this.#db = new Database(this.#dbPath, { timeout: 5000 });
-    this.#db.pragma("journal_mode = WAL");
-    this.#db.pragma("synchronous = NORMAL");
+    applyWALPragmas(this.#db);
     this.#initSchema();
     this.#prepareStatements();
   }
