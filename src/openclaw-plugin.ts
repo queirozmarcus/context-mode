@@ -233,6 +233,7 @@ export default {
     const db = getOrCreateDB(projectDir);
     // Start with temp UUID — session_start will assign the real ID + sessionKey
     let sessionId = randomUUID();
+    log.info("register() called, sessionId:", sessionId.slice(0, 8));
     let resumeInjected = false;
     // Create temp session so after_tool_call events before session_start have a valid row
     db.ensureSession(sessionId, projectDir);
@@ -289,6 +290,8 @@ export default {
         }
 
         if (!decision) return; // No routing match → passthrough
+
+        log.debug("before_tool_call", { tool: toolName, action: decision.action });
 
         if (decision.action === "deny" || decision.action === "ask") {
           return {
@@ -355,7 +358,7 @@ export default {
             for (const ev of events) {
               db.insertEvent(routedSessionId, ev as SessionEvent, "PostToolUse");
             }
-            log.debug(`tool_call:after [${mappedToolName}] → ${events.length} event(s) routed to ${routedSessionId.slice(0, 8)}…`);
+            log.debug("after_tool_call", { tool: rawToolName, mapped: mappedToolName, sessionId: routedSessionId.slice(0, 8), events: events.length, durationMs: e.durationMs });
           } else if (rawToolName) {
             // Fallback: record any unrecognized tool call as a generic event
             const data = JSON.stringify({
@@ -377,7 +380,7 @@ export default {
               },
               "PostToolUse",
             );
-            log.debug(`tool_call:after [${rawToolName}] → generic fallback routed to ${routedSessionId.slice(0, 8)}…`);
+            log.debug("after_tool_call", { tool: rawToolName, mapped: rawToolName, sessionId: routedSessionId.slice(0, 8), events: 1, durationMs: e.durationMs });
           }
         } catch {
           // Silent — session capture must never break the tool call
@@ -391,6 +394,7 @@ export default {
       "command:new",
       async () => {
         try {
+          log.debug("command:new", { sessionId: sessionId.slice(0, 8) });
           db.cleanupOldSessions(7);
         } catch {
           // best effort
@@ -409,6 +413,7 @@ export default {
       "command:reset",
       async () => {
         try {
+          log.debug("command:reset", { sessionId: sessionId.slice(0, 8) });
           db.cleanupOldSessions(7);
         } catch {
           // best effort
@@ -424,6 +429,7 @@ export default {
       "command:stop",
       async () => {
         try {
+          log.debug("command:stop", { sessionId: sessionId.slice(0, 8) });
           db.cleanupOldSessions(7);
         } catch {
           // best effort
@@ -446,6 +452,8 @@ export default {
           if (!sid) return;
 
           const key = e?.sessionKey;
+          const resumedFrom = e?.resumedFrom;
+          log.debug("session_start", { sessionId: sid.slice(0, 8), sessionKey: key, resumedFrom });
 
           if (key) {
             // Per-agent session lookup via sessionKey
@@ -482,13 +490,14 @@ export default {
       async () => {
         try {
           const sid = sessionId; // snapshot to avoid race with concurrent session_start
-          const events = db.getEvents(sid);
-          if (events.length === 0) return;
+          const allEvents = db.getEvents(sid);
+          log.debug("before_compaction", { sessionId: sid.slice(0, 8), events: allEvents.length });
+          if (allEvents.length === 0) return;
           const freshStats = db.getSessionStats(sid);
-          const snapshot = buildResumeSnapshot(events, {
+          const snapshot = buildResumeSnapshot(allEvents, {
             compactCount: (freshStats?.compact_count ?? 0) + 1,
           });
-          db.upsertResume(sid, snapshot, events.length);
+          db.upsertResume(sid, snapshot, allEvents.length);
         } catch {
           // best effort — never break compaction
         }
@@ -501,7 +510,9 @@ export default {
       "after_compaction",
       async () => {
         try {
-          db.incrementCompactCount(sessionId); // sessionId consistent with before_compaction within same sync cycle
+          const sid = sessionId;
+          log.debug("after_compaction", { sessionId: sid.slice(0, 8) });
+          db.incrementCompactCount(sid); // sessionId consistent with before_compaction within same sync cycle
         } catch {
           // best effort
         }
@@ -516,9 +527,10 @@ export default {
         try {
           const sid = sessionId; // snapshot to avoid race with concurrent session_start
           const e = event as BeforeModelResolveEvent;
-          const text = e?.userMessage ?? e?.message ?? e?.content ?? "";
-          if (!text) return;
-          const events = extractUserEvents(text);
+          const messageText = e?.userMessage ?? e?.message ?? e?.content ?? "";
+          log.debug("before_model_resolve", { hasMessage: !!messageText });
+          if (!messageText) return;
+          const events = extractUserEvents(messageText);
           for (const ev of events) {
             db.insertEvent(sid, ev as import("./types.js").SessionEvent, "PostToolUse");
           }
@@ -535,13 +547,13 @@ export default {
       () => {
         try {
           const sid = sessionId; // snapshot to avoid race with concurrent session_start
-          if (resumeInjected) return undefined;
           const resume = db.getResume(sid);
+          log.debug("before_prompt_build[resume]", { sessionId: sid.slice(0, 8), hasResume: !!resume, injected: !resumeInjected });
+          if (resumeInjected) return undefined;
           if (!resume) return undefined;
           const freshStats = db.getSessionStats(sid);
           if ((freshStats?.compact_count ?? 0) === 0) return undefined;
           resumeInjected = true;
-          log.debug(`before_prompt_build: injecting resume snapshot (${resume.snapshot.length} chars)`);
           return { prependSystemContext: resume.snapshot };
         } catch {
           return undefined;
@@ -555,9 +567,10 @@ export default {
     if (routingInstructions) {
       api.on(
         "before_prompt_build",
-        () => ({
-          appendSystemContext: routingInstructions,
-        }),
+        () => {
+          log.debug("before_prompt_build[routing]", { hasInstructions: !!routingInstructions });
+          return { appendSystemContext: routingInstructions };
+        },
         { priority: 5 },
       );
     }
