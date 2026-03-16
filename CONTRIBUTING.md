@@ -265,6 +265,25 @@ We follow test-driven development. Every PR must include tests.
 2. **Green** -- Write the minimum code to make it pass
 3. **Refactor** -- Clean up while keeping tests green
 
+### Test file organization
+
+**Do NOT create new test files.** Add your tests to the existing file that covers the same domain. We maintain a small number of well-organized test files — one per adapter, one per core module. Creating a new file per feature or per PR leads to fragmentation that makes the suite harder to navigate and maintain.
+
+| Domain | Test File |
+|---|---|
+| Adapters | `tests/adapters/<platform>.test.ts` |
+| Hook routing | `tests/hooks/core-routing.test.ts` |
+| Hook formatting | `tests/hooks/formatters.test.ts` |
+| Session DB | `tests/session/session-db.test.ts` |
+| Session extract | `tests/session/session-extract.test.ts` |
+| Session snapshot | `tests/session/session-snapshot.test.ts` |
+| Executor | `tests/executor.test.ts` |
+| Store/Search | `tests/store.test.ts` |
+| Security | `tests/security.test.ts` |
+| Hook integration | `tests/hook-integration.test.ts` |
+
+If your change doesn't fit any existing file, discuss with the maintainer before creating a new one.
+
 ### Output quality matters
 
 When your change affects tool output (execute, search, fetch_and_index, etc.), always compare before and after:
