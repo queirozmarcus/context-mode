@@ -34,7 +34,6 @@ https://github.com/user-attachments/assets/07013dbf-07c0-4ef1-974a-33ea1207637b
 ```bash
 claude plugin marketplace add queirozmarcus/context-mode
 claude plugin install context-mode@context-mode
-/plugin install context-mode@context-mode
 ```
 
 **Step 2 — Restart Claude Code.**
