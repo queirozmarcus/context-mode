@@ -32,7 +32,8 @@ https://github.com/user-attachments/assets/07013dbf-07c0-4ef1-974a-33ea1207637b
 **Step 1 — Install the plugin:**
 
 ```bash
-/plugin marketplace add mksglu/context-mode
+claude plugin marketplace add queirozmarcus/context-mode
+claude plugin install context-mode@context-mode
 /plugin install context-mode@context-mode
 ```
 
