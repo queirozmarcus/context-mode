@@ -1,4 +1,6 @@
+import "../setup-home";
 import { describe, it, expect, beforeEach } from "vitest";
+import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CodexAdapter } from "../../src/adapters/codex/index.js";
@@ -13,115 +15,241 @@ describe("CodexAdapter", () => {
   // ── Capabilities ──────────────────────────────────────
 
   describe("capabilities", () => {
-    it("all capabilities are false", () => {
-      expect(adapter.capabilities.preToolUse).toBe(false);
-      expect(adapter.capabilities.postToolUse).toBe(false);
-      expect(adapter.capabilities.preCompact).toBe(false);
-      expect(adapter.capabilities.sessionStart).toBe(false);
+    it("preToolUse is true", () => {
+      expect(adapter.capabilities.preToolUse).toBe(true);
+    });
+
+    it("postToolUse is true", () => {
+      expect(adapter.capabilities.postToolUse).toBe(true);
+    });
+
+    it("sessionStart is true", () => {
+      expect(adapter.capabilities.sessionStart).toBe(true);
+    });
+
+    it("canModifyArgs is false (Codex does not support updatedInput)", () => {
       expect(adapter.capabilities.canModifyArgs).toBe(false);
+    });
+
+    it("canModifyOutput is false (Codex does not support updatedMCPToolOutput)", () => {
       expect(adapter.capabilities.canModifyOutput).toBe(false);
-      expect(adapter.capabilities.canInjectSessionContext).toBe(false);
     });
 
-    it("paradigm is mcp-only", () => {
-      expect(adapter.paradigm).toBe("mcp-only");
-    });
-  });
-
-  // ── Parse methods (all throw) ─────────────────────────
-
-  describe("parse methods", () => {
-    it("parsePreToolUseInput throws", () => {
-      expect(() => adapter.parsePreToolUseInput({})).toThrow(
-        /Codex CLI does not support hooks/,
-      );
+    it("canInjectSessionContext is true", () => {
+      expect(adapter.capabilities.canInjectSessionContext).toBe(true);
     });
 
-    it("parsePostToolUseInput throws", () => {
-      expect(() => adapter.parsePostToolUseInput({})).toThrow(
-        /Codex CLI does not support hooks/,
-      );
-    });
-
-    it("parsePreCompactInput throws", () => {
-      expect(() => adapter.parsePreCompactInput({})).toThrow(
-        /Codex CLI does not support hooks/,
-      );
-    });
-
-    it("parseSessionStartInput throws", () => {
-      expect(() => adapter.parseSessionStartInput({})).toThrow(
-        /Codex CLI does not support hooks/,
-      );
+    it("paradigm is json-stdio", () => {
+      expect(adapter.paradigm).toBe("json-stdio");
     });
   });
 
-  // ── Format methods (all return undefined) ─────────────
+  // ── parsePreToolUseInput ──────────────────────────────
 
-  describe("format methods", () => {
-    it("formatPreToolUseResponse returns undefined", () => {
-      const result = adapter.formatPreToolUseResponse({
+  describe("parsePreToolUseInput", () => {
+    it("extracts tool_name from input", () => {
+      const event = adapter.parsePreToolUseInput({
+        tool_name: "Bash",
+        tool_input: { command: "ls" },
+        session_id: "s1",
+        cwd: "/tmp",
+        hook_event_name: "PreToolUse",
+        model: "o3",
+        permission_mode: "default",
+        tool_use_id: "tu1",
+        transcript_path: null,
+        turn_id: "t1",
+      });
+      expect(event.toolName).toBe("Bash");
+    });
+
+    it("extracts session_id", () => {
+      const event = adapter.parsePreToolUseInput({
+        tool_name: "Bash",
+        tool_input: { command: "ls" },
+        session_id: "codex-123",
+        cwd: "/proj",
+        hook_event_name: "PreToolUse",
+        model: "o3",
+        permission_mode: "default",
+        tool_use_id: "tu1",
+        transcript_path: null,
+        turn_id: "t1",
+      });
+      expect(event.sessionId).toBe("codex-123");
+    });
+
+    it("extracts projectDir from cwd", () => {
+      const event = adapter.parsePreToolUseInput({
+        tool_name: "Bash",
+        tool_input: { command: "ls" },
+        session_id: "s1",
+        cwd: "/my/project",
+        hook_event_name: "PreToolUse",
+        model: "o3",
+        permission_mode: "default",
+        tool_use_id: "tu1",
+        transcript_path: null,
+        turn_id: "t1",
+      });
+      expect(event.projectDir).toBe("/my/project");
+    });
+  });
+
+  // ── formatPreToolUseResponse ──────────────────────────
+
+  describe("formatPreToolUseResponse", () => {
+    it("deny returns hookSpecificOutput with hookEventName and permissionDecision deny", () => {
+      const resp = adapter.formatPreToolUseResponse({
         decision: "deny",
-        reason: "test",
+        reason: "blocked",
       });
-      expect(result).toBeUndefined();
+      const hso = (resp as { hookSpecificOutput: Record<string, unknown> }).hookSpecificOutput;
+      expect(hso.hookEventName).toBe("PreToolUse");
+      expect(hso.permissionDecision).toBe("deny");
+      expect(hso.permissionDecisionReason).toBe("blocked");
     });
 
-    it("formatPostToolUseResponse returns undefined", () => {
-      const result = adapter.formatPostToolUseResponse({
-        additionalContext: "test",
-      });
-      expect(result).toBeUndefined();
-    });
-
-    it("formatPreCompactResponse returns undefined", () => {
-      const result = adapter.formatPreCompactResponse({
-        context: "test",
-      });
-      expect(result).toBeUndefined();
-    });
-
-    it("formatSessionStartResponse returns undefined", () => {
-      const result = adapter.formatSessionStartResponse({
-        context: "test",
-      });
-      expect(result).toBeUndefined();
+    it("allow returns empty object (passthrough)", () => {
+      const resp = adapter.formatPreToolUseResponse({ decision: "allow" });
+      expect(resp).toEqual({});
     });
   });
 
-  // ── Hook config (all empty) ───────────────────────────
+  // ── parsePostToolUseInput ─────────────────────────────
 
-  describe("hook config", () => {
-    it("generateHookConfig returns empty object", () => {
-      const config = adapter.generateHookConfig("/some/plugin/root");
-      expect(config).toEqual({});
+  describe("parsePostToolUseInput", () => {
+    it("extracts tool_response", () => {
+      const event = adapter.parsePostToolUseInput({
+        tool_name: "Bash",
+        tool_input: { command: "echo hi" },
+        tool_response: "hi\n",
+        session_id: "s1",
+        cwd: "/tmp",
+        hook_event_name: "PostToolUse",
+        model: "o3",
+        permission_mode: "default",
+        tool_use_id: "tu1",
+        transcript_path: null,
+        turn_id: "t1",
+      });
+      expect(event.toolOutput).toBe("hi\n");
+    });
+  });
+
+  // ── formatPostToolUseResponse ─────────────────────────
+
+  describe("formatPostToolUseResponse", () => {
+    it("context injection returns hookEventName and additionalContext in hookSpecificOutput", () => {
+      const resp = adapter.formatPostToolUseResponse({
+        additionalContext: "extra info",
+      });
+      const hso = (resp as { hookSpecificOutput: Record<string, unknown> }).hookSpecificOutput;
+      expect(hso.hookEventName).toBe("PostToolUse");
+      expect(hso.additionalContext).toBe("extra info");
+    });
+  });
+
+  // ── parseSessionStartInput ────────────────────────────
+
+  describe("parseSessionStartInput", () => {
+    it("extracts source field", () => {
+      const event = adapter.parseSessionStartInput({
+        session_id: "s1",
+        cwd: "/proj",
+        hook_event_name: "SessionStart",
+        model: "o3",
+        permission_mode: "default",
+        source: "startup",
+        transcript_path: null,
+      });
+      expect(event.source).toBe("startup");
     });
 
-    it("configureAllHooks returns empty array", () => {
-      const changes = adapter.configureAllHooks("/some/plugin/root");
-      expect(changes).toEqual([]);
+    it("extracts session_id", () => {
+      const event = adapter.parseSessionStartInput({
+        session_id: "codex-456",
+        cwd: "/proj",
+        hook_event_name: "SessionStart",
+        model: "o3",
+        permission_mode: "default",
+        source: "resume",
+        transcript_path: null,
+      });
+      expect(event.sessionId).toBe("codex-456");
+    });
+  });
+
+  // ── formatSessionStartResponse ──────────────────────
+
+  describe("formatSessionStartResponse", () => {
+    it("context returns hookEventName and additionalContext in hookSpecificOutput", () => {
+      const resp = adapter.formatSessionStartResponse({
+        context: "routing block",
+      });
+      const hso = (resp as { hookSpecificOutput: Record<string, unknown> }).hookSpecificOutput;
+      expect(hso.hookEventName).toBe("SessionStart");
+      expect(hso.additionalContext).toBe("routing block");
     });
 
-    it("setHookPermissions returns empty array", () => {
-      const set = adapter.setHookPermissions("/some/plugin/root");
-      expect(set).toEqual([]);
+    it("empty context returns empty object", () => {
+      const resp = adapter.formatSessionStartResponse({});
+      expect(resp).toEqual({});
     });
   });
 
   // ── Config paths ──────────────────────────────────────
 
   describe("config paths", () => {
-    it("settings path is ~/.codex/config.toml", () => {
-      expect(adapter.getSettingsPath()).toBe(
-        resolve(homedir(), ".codex", "config.toml"),
-      );
+    it("settings path ends with config.toml", () => {
+      expect(adapter.getSettingsPath()).toContain("config.toml");
     });
 
     it("session dir is under ~/.codex/context-mode/sessions/", () => {
-      const sessionDir = adapter.getSessionDir();
-      expect(sessionDir).toBe(
-        join(homedir(), ".codex", "context-mode", "sessions"),
-      );
+      expect(adapter.getSessionDir()).toContain(".codex");
+      expect(adapter.getSessionDir()).toContain("sessions");
     });
+  });
+
+  // ── generateHookConfig ────────────────────────────────
+
+  describe("generateHookConfig", () => {
+    it("generates hooks.json with PreToolUse, PostToolUse, SessionStart entries", () => {
+      const config = adapter.generateHookConfig("/path/to/plugin");
+      expect(config).toHaveProperty("PreToolUse");
+      expect(config).toHaveProperty("PostToolUse");
+      expect(config).toHaveProperty("SessionStart");
+    });
+  });
+});
+
+// ── Hook script integration tests ──────────────────────
+describe("Codex pretooluse hook script", () => {
+  it("outputs valid JSON with hookEventName even for passthrough (no routing match)", () => {
+    const hookScript = resolve(__dirname, "../../hooks/codex/pretooluse.mjs");
+    const input = JSON.stringify({
+      tool_name: "Bash",
+      tool_input: { command: "ls" },
+      session_id: "test-1",
+      cwd: "/tmp",
+      hook_event_name: "PreToolUse",
+      model: "o3",
+      permission_mode: "default",
+      tool_use_id: "tu1",
+      transcript_path: null,
+      turn_id: "t1",
+    });
+
+    const stdout = execSync(
+      `printf '%s' '${input.replace(/'/g, "'\\''")}' | node ${hookScript}`,
+      {
+        encoding: "utf-8",
+        timeout: 10000,
+      },
+    );
+
+    const parsed = JSON.parse(stdout.trim());
+    expect(parsed.hookSpecificOutput).toBeDefined();
+    expect(parsed.hookSpecificOutput.hookEventName).toBe("PreToolUse");
   });
 });

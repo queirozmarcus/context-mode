@@ -10,8 +10,24 @@
  * - null (passthrough)
  */
 
-import { ROUTING_BLOCK, READ_GUIDANCE, GREP_GUIDANCE, BASH_GUIDANCE } from "../routing-block.mjs";
+import {
+  ROUTING_BLOCK, READ_GUIDANCE, GREP_GUIDANCE, BASH_GUIDANCE,
+  createRoutingBlock, createReadGuidance, createGrepGuidance, createBashGuidance,
+} from "../routing-block.mjs";
+import { createToolNamer } from "./tool-naming.mjs";
+import { isMCPReady } from "./mcp-ready.mjs";
 import { existsSync, mkdirSync, rmSync, openSync, closeSync, constants as fsConstants } from "node:fs";
+
+/**
+ * Guard for actions that redirect to MCP tools (#230).
+ * If MCP server isn't ready, returns null (passthrough) instead of the
+ * redirect action — prevents agent from getting stuck when MCP tools
+ * are unavailable. Applies to deny and modify actions that mention MCP alternatives.
+ */
+function mcpRedirect(result) {
+  if (!isMCPReady()) return null;
+  return result;
+}
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -129,8 +145,22 @@ const TOOL_ALIASES = {
 
 /**
  * Route a PreToolUse event. Returns normalized decision object or null for passthrough.
+ *
+ * @param {string} toolName - The tool name as reported by the platform
+ * @param {object} toolInput - The tool input/parameters
+ * @param {string} [projectDir] - Project directory for security policy lookup
+ * @param {string} [platform="claude-code"] - Platform ID for tool name formatting
  */
-export function routePreToolUse(toolName, toolInput, projectDir) {
+export function routePreToolUse(toolName, toolInput, projectDir, platform) {
+  // Build platform-specific tool namer (defaults to claude-code for backward compat)
+  const t = createToolNamer(platform || "claude-code");
+
+  // Build platform-specific guidance/routing content
+  const routingBlock = platform ? createRoutingBlock(t) : ROUTING_BLOCK;
+  const readGuidance = platform ? createReadGuidance(t) : READ_GUIDANCE;
+  const grepGuidance = platform ? createGrepGuidance(t) : GREP_GUIDANCE;
+  const bashGuidance = platform ? createBashGuidance(t) : BASH_GUIDANCE;
+
   // Normalize platform-specific tool name to canonical
   const canonical = TOOL_ALIASES[toolName] ?? toolName;
 
@@ -162,14 +192,52 @@ export function routePreToolUse(toolName, toolInput, projectDir) {
     // like `gh issue edit --body "text with curl in it"` (Issue #63).
     const stripped = stripQuotedContent(command);
 
-    // curl/wget → replace with echo redirect
+    // curl/wget — allow silent file-output downloads, block stdout floods (#166).
+    // Algorithm: split chained commands, evaluate each segment independently.
     if (/(^|\s|&&|\||\;)(curl|wget)\s/i.test(stripped)) {
-      return {
-        action: "modify",
-        updatedInput: {
-          command: 'echo "context-mode: curl/wget blocked. You MUST use mcp__plugin_context-mode_context-mode__ctx_fetch_and_index(url, source) to fetch URLs, or mcp__plugin_context-mode_context-mode__ctx_execute(language, code) to run HTTP calls in sandbox. Do NOT retry with curl/wget."',
-        },
-      };
+      // Split on chain operators (&&, ||, ;) to evaluate each segment
+      const segments = stripped.split(/\s*(?:&&|\|\||;)\s*/);
+      const hasDangerousSegment = segments.some(seg => {
+        const s = seg.trim();
+        // Only evaluate segments that contain curl or wget
+        if (!/(^|\s)(curl|wget)\s/i.test(s)) return false;
+
+        const isCurl = /\bcurl\b/i.test(s);
+        const isWget = /\bwget\b/i.test(s);
+
+        // Check for file output flags
+        const hasFileOutput = isCurl
+          ? /\s(-o|--output)\s/.test(s) || /\s*>\s*/.test(s) || /\s*>>\s*/.test(s)
+          : /\s(-O|--output-document)\s/.test(s) || /\s*>\s*/.test(s) || /\s*>>\s*/.test(s);
+
+        if (!hasFileOutput) return true; // no file output → dangerous
+
+        // Stdout aliases: -o -, -o /dev/stdout, -O -
+        if (isCurl && /\s(-o|--output)\s+(-|\/dev\/stdout)(\s|$)/.test(s)) return true;
+        if (isWget && /\s(-O|--output-document)\s+(-|\/dev\/stdout)(\s|$)/.test(s)) return true;
+
+        // Verbose/trace flags flood stderr → context
+        if (/\s(-v|--verbose|--trace|-D\s+-)\b/.test(s)) return true;
+
+        // Must be silent (curl: -s/--silent, wget: -q/--quiet) to prevent progress bar stderr flood
+        const isSilent = isCurl
+          ? /\s-[a-zA-Z]*s|--silent/.test(s)
+          : /\s-[a-zA-Z]*q|--quiet/.test(s);
+        if (!isSilent) return true;
+
+        return false; // safe: silent + file output + no verbose + no stdout alias
+      });
+
+      if (hasDangerousSegment) {
+        return mcpRedirect({
+          action: "modify",
+          updatedInput: {
+            command: `echo "context-mode: curl/wget blocked. Think in Code — use ${t("ctx_execute")}(language, code) to write code that fetches, processes, and prints only the answer. Or use ${t("ctx_fetch_and_index")}(url, source) to fetch and index. Write pure JS with try/catch, no npm deps. Do NOT retry with curl/wget."`,
+          },
+        });
+      }
+      // All segments safe → allow through
+      return null;
     }
 
     // Inline HTTP detection: strip only heredocs (not quotes) so that
@@ -183,60 +251,63 @@ export function routePreToolUse(toolName, toolInput, projectDir) {
       /requests\.(get|post|put)\s*\(/i.test(noHeredoc) ||
       /http\.(get|request)\s*\(/i.test(noHeredoc)
     ) {
-      return {
+      return mcpRedirect({
         action: "modify",
         updatedInput: {
-          command: 'echo "context-mode: Inline HTTP blocked. Use mcp__plugin_context-mode_context-mode__ctx_execute(language, code) to run HTTP calls in sandbox, or mcp__plugin_context-mode_context-mode__ctx_fetch_and_index(url, source) for web pages. Do NOT retry with Bash."',
+          command: `echo "context-mode: Inline HTTP blocked. Think in Code — use ${t("ctx_execute")}(language, code) to write code that fetches, processes, and console.log() only the result. Write robust pure JS with try/catch, no npm deps. Do NOT retry with Bash."`,
         },
-      };
+      });
     }
 
     // Build tools (gradle, maven) → redirect to execute sandbox (Issue #38).
     // These produce extremely verbose output that should stay in sandbox.
     if (/(^|\s|&&|\||\;)(\.\/gradlew|gradlew|gradle|\.\/mvnw|mvnw|mvn)\s/i.test(stripped)) {
       const safeCmd = command.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-      return {
+      return mcpRedirect({
         action: "modify",
         updatedInput: {
-          command: `echo "context-mode: Build tool redirected to sandbox. Use mcp__plugin_context-mode_context-mode__ctx_execute(language: \\"shell\\", code: \\"${safeCmd}\\") to run this command. Do NOT retry with Bash."`,
+          command: `echo "context-mode: Build tool redirected. Think in Code — use ${t("ctx_execute")}(language: \\"shell\\", code: \\"${safeCmd} 2>&1 | tail -30\\") to run and print only errors/summary. Do NOT retry with Bash."`,
         },
-      };
+      });
     }
 
     // allow all other Bash commands, but inject routing nudge (once per session)
-    return guidanceOnce("bash", BASH_GUIDANCE);
+    return guidanceOnce("bash", bashGuidance);
   }
 
   // ─── Read: nudge toward execute_file (once per session) ───
   if (canonical === "Read") {
-    return guidanceOnce("read", READ_GUIDANCE);
+    return guidanceOnce("read", readGuidance);
   }
 
   // ─── Grep: nudge toward execute (once per session) ───
   if (canonical === "Grep") {
-    return guidanceOnce("grep", GREP_GUIDANCE);
+    return guidanceOnce("grep", grepGuidance);
   }
 
   // ─── WebFetch: deny + redirect to sandbox ───
   if (canonical === "WebFetch") {
     const url = toolInput.url ?? "";
-    return {
+    return mcpRedirect({
       action: "deny",
-      reason: `context-mode: WebFetch blocked. Use mcp__plugin_context-mode_context-mode__ctx_fetch_and_index(url: "${url}", source: "...") to fetch this URL in sandbox. Then use mcp__plugin_context-mode_context-mode__ctx_search(queries: [...]) to query results. Do NOT use curl, wget, mcp_web_fetch, or mcp_fetch_tool.`,
-    };
+      reason: `context-mode: WebFetch blocked. Think in Code — use ${t("ctx_fetch_and_index")}(url: "${url}", source: "...") to fetch and index, then ${t("ctx_search")}(queries: [...]) to query. Or use ${t("ctx_execute")}(language, code) to fetch, process, and console.log() only what you need. Write pure JS, no npm deps. Do NOT use curl, wget, or WebFetch.`,
+    });
   }
 
-  // ─── Agent/Task: inject context-mode routing into subagent prompts ───
-  if (canonical === "Agent" || canonical === "Task") {
+  // ─── Agent: inject context-mode routing into subagent prompts ───
+  // Subagents cannot use ctx commands (stats/doctor/upgrade/purge) — omit that section (#233)
+  if (canonical === "Agent") {
     const subagentType = toolInput.subagent_type ?? "";
     // Detect the correct field name for the prompt/request/objective/question/query
     const fieldName = ["prompt", "request", "objective", "question", "query", "task"].find(f => f in toolInput) ?? "prompt";
     const prompt = toolInput[fieldName] ?? "";
 
+    const subagentBlock = createRoutingBlock(t, { includeCommands: false });
+
     const updatedInput =
       subagentType === "Bash"
-        ? { ...toolInput, [fieldName]: prompt + ROUTING_BLOCK, subagent_type: "general-purpose" }
-        : { ...toolInput, [fieldName]: prompt + ROUTING_BLOCK };
+        ? { ...toolInput, [fieldName]: prompt + subagentBlock, subagent_type: "general-purpose" }
+        : { ...toolInput, [fieldName]: prompt + subagentBlock };
 
     return { action: "modify", updatedInput };
   }

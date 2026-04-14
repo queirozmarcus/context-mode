@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 import "../suppress-stderr.mjs";
+import "../ensure-deps.mjs";
 /**
  * Cursor sessionStart hook for context-mode.
  */
 
-import { ROUTING_BLOCK } from "../routing-block.mjs";
+import { createRoutingBlock } from "../routing-block.mjs";
+import { createToolNamer } from "../core/tool-naming.mjs";
+
+const toolNamer = createToolNamer("cursor");
+const ROUTING_BLOCK = createRoutingBlock(toolNamer);
 import {
   writeSessionEventsFile,
   buildSessionDirective,
@@ -20,12 +25,12 @@ import {
   getInputProjectDir,
   CURSOR_OPTS,
 } from "../session-helpers.mjs";
-import { join } from "node:path";
-import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { unlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { createSessionLoaders } from "../session-loaders.mjs";
 
 const HOOK_DIR = fileURLToPath(new URL(".", import.meta.url));
-const PKG_SESSION = join(HOOK_DIR, "..", "..", "build", "session");
+const { loadSessionDB } = createSessionLoaders(HOOK_DIR);
 const OPTS = CURSOR_OPTS;
 
 let additionalContext = ROUTING_BLOCK;
@@ -41,7 +46,7 @@ try {
   }
 
   if (source === "compact" || source === "resume") {
-    const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
+    const { SessionDB } = await loadSessionDB();
     const dbPath = getSessionDBPath(OPTS);
     const db = new SessionDB({ dbPath });
 
@@ -60,27 +65,18 @@ try {
       : getLatestSessionEvents(db);
     if (events.length > 0) {
       const eventMeta = writeSessionEventsFile(events, getSessionEventsPath(OPTS));
-      additionalContext += buildSessionDirective(source, eventMeta);
+      additionalContext += buildSessionDirective(source, eventMeta, toolNamer);
     }
 
     db.close();
   } else if (source === "startup") {
-    const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
+    const { SessionDB } = await loadSessionDB();
     const dbPath = getSessionDBPath(OPTS);
     const db = new SessionDB({ dbPath });
     try { unlinkSync(getSessionEventsPath(OPTS)); } catch { /* no stale file */ }
 
-    const cleanupFlag = getCleanupFlagPath(OPTS);
-    let previousWasFresh = false;
-    try { readFileSync(cleanupFlag); previousWasFresh = true; } catch { /* no flag */ }
-
-    if (previousWasFresh) {
-      db.cleanupOldSessions(0);
-    } else {
-      db.cleanupOldSessions(7);
-    }
+    db.cleanupOldSessions(7);
     db.db.exec(`DELETE FROM session_events WHERE session_id NOT IN (SELECT session_id FROM session_meta)`);
-    writeFileSync(cleanupFlag, new Date().toISOString(), "utf-8");
 
     const sessionId = getSessionId(input, OPTS);
     db.ensureSession(sessionId, projectDir);

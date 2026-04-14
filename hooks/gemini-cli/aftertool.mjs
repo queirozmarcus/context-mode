@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import "../suppress-stderr.mjs";
+import "../ensure-deps.mjs";
 /**
  * Gemini CLI AfterTool hook — session event capture.
  *
@@ -10,13 +11,14 @@ import "../suppress-stderr.mjs";
  */
 
 import { readStdin, getSessionId, getSessionDBPath, getProjectDir, GEMINI_OPTS } from "../session-helpers.mjs";
+import { createSessionLoaders } from "../session-loaders.mjs";
 import { appendFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-const PKG_SESSION = join(HOOK_DIR, "..", "..", "build", "session");
+const { loadSessionDB, loadExtract } = createSessionLoaders(HOOK_DIR);
 const OPTS = GEMINI_OPTS;
 const DEBUG_LOG = join(homedir(), ".gemini", "context-mode", "aftertool-debug.log");
 
@@ -26,8 +28,8 @@ try {
 
   appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] CALL: ${input.tool_name}\n`);
 
-  const { extractEvents } = await import(pathToFileURL(join(PKG_SESSION, "extract.js")).href);
-  const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
+  const { extractEvents } = await loadExtract();
+  const { SessionDB } = await loadSessionDB();
 
   const dbPath = getSessionDBPath(OPTS);
   const db = new SessionDB({ dbPath });

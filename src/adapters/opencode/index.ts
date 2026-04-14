@@ -17,6 +17,14 @@
  */
 
 import { createHash } from "node:crypto";
+
+/** Strip JSONC comments (// and /* *​/) and trailing commas for JSON.parse. */
+function stripJsonComments(str: string): string {
+  return str
+    .replace(/\/\/.*$/gm, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/,(\s*[}\]])/g, "$1");
+}
 import {
   readFileSync,
   writeFileSync,
@@ -42,20 +50,30 @@ import type {
   PreCompactResponse,
   SessionStartResponse,
   HookRegistration,
-  RoutingInstructionsConfig,
+  PlatformId,
 } from "../types.js";
 
 // ─────────────────────────────────────────────────────────
 // OpenCode raw input types
 // ─────────────────────────────────────────────────────────
 
+/** Represents the combined input+output from OpenCode hooks, flattened for adapter parse methods. */
 interface OpenCodeHookInput {
-  tool_name?: string;
-  tool_input?: Record<string, unknown>;
-  tool_output?: string;
-  is_error?: boolean;
-  /** OpenCode uses camelCase for session ID. */
+  /** From input.tool (both before and after hooks) */
+  tool?: string;
+  /** From input.sessionID */
   sessionID?: string;
+  /** From input.callID */
+  callID?: string;
+  /** From output.args (before hook) or input.args (after hook) */
+  args?: Record<string, unknown>;
+  /** From output.output (after hook) */
+  output?: string;
+  /** From output.title (after hook) */
+  title?: string;
+  /** From output.metadata (after hook) */
+  metadata?: unknown;
+  /** For session start source (custom) */
   source?: string;
 }
 
@@ -69,27 +87,38 @@ import { HOOK_TYPES as OPENCODE_HOOK_NAMES } from "./hooks.js";
 // Adapter implementation
 // ─────────────────────────────────────────────────────────
 
+export type AdapterPlatformType = Extract<PlatformId, "opencode" | "kilo">;
+
 export class OpenCodeAdapter implements HookAdapter {
-  readonly name = "OpenCode";
+  get name(): string {
+    return this.platform === "kilo" ? "KiloCode" : "OpenCode";
+  }
   readonly paradigm: HookParadigm = "ts-plugin";
+  private settingsPath?: string;
 
   readonly capabilities: PlatformCapabilities = {
     preToolUse: true,
     postToolUse: true,
     preCompact: true, // experimental
-    sessionStart: true,
+    sessionStart: false,
     canModifyArgs: true,
     canModifyOutput: true, // with TUI bug caveat for bash (#13575)
     canInjectSessionContext: false,
   };
+
+  private platform: AdapterPlatformType;
+
+  constructor(platform: AdapterPlatformType = "opencode") {
+    this.platform = platform;
+  }
 
   // ── Input parsing ──────────────────────────────────────
 
   parsePreToolUseInput(raw: unknown): PreToolUseEvent {
     const input = raw as OpenCodeHookInput;
     return {
-      toolName: input.tool_name ?? "",
-      toolInput: input.tool_input ?? {},
+      toolName: input.tool ?? "",
+      toolInput: input.args ?? {},
       sessionId: this.extractSessionId(input),
       projectDir: process.env.OPENCODE_PROJECT_DIR || process.cwd(),
       raw,
@@ -99,10 +128,10 @@ export class OpenCodeAdapter implements HookAdapter {
   parsePostToolUseInput(raw: unknown): PostToolUseEvent {
     const input = raw as OpenCodeHookInput;
     return {
-      toolName: input.tool_name ?? "",
-      toolInput: input.tool_input ?? {},
-      toolOutput: input.tool_output,
-      isError: input.is_error,
+      toolName: input.tool ?? "",
+      toolInput: input.args ?? {},
+      toolOutput: input.output,
+      isError: undefined, // OpenCode doesn't provide isError
       sessionId: this.extractSessionId(input),
       projectDir: process.env.OPENCODE_PROJECT_DIR || process.cwd(),
       raw,
@@ -196,11 +225,38 @@ export class OpenCodeAdapter implements HookAdapter {
 
   getSettingsPath(): string {
     // OpenCode uses opencode.json in the project root or .opencode/opencode.json
-    return resolve("opencode.json");
+    return this.settingsPath ?? resolve(`${this.platform}.json`);
+  }
+
+  private paths(): string[] {
+    if (this.platform === "kilo") {
+      return [
+        resolve("kilo.json"),
+        resolve("kilo.jsonc"),
+        resolve(".kilo", "kilo.json"),
+        resolve(".kilo", "kilo.jsonc"),
+        join(homedir(), ".config", "kilo", "kilo.json"),
+        join(homedir(), ".config", "kilo", "kilo.jsonc"),
+      ];  
+    }
+    return [
+      resolve("opencode.json"),
+      resolve("opencode.jsonc"),
+      resolve(".opencode", "opencode.json"),
+      resolve(".opencode", "opencode.jsonc"),
+      join(homedir(), ".config", "opencode", "opencode.json"),
+      join(homedir(), ".config", "opencode", "opencode.jsonc"),
+    ];
   }
 
   getSessionDir(): string {
-    const dir = join(homedir(), ".config", "opencode", "context-mode", "sessions");
+    let configDir: string;
+    if (process.platform === "win32") {
+      configDir = process.env.APPDATA || join(homedir(), "AppData", "Roaming");
+    } else {
+      configDir = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+    }
+    const dir = join(configDir, this.platform, "context-mode", "sessions");
     mkdirSync(dir, { recursive: true });
     return dir;
   }
@@ -263,28 +319,45 @@ export class OpenCodeAdapter implements HookAdapter {
   }
 
   readSettings(): Record<string, unknown> | null {
-    // Try project-local paths first, then global config
-    const paths = [
-      resolve("opencode.json"),
-      resolve(".opencode", "opencode.json"),
-      join(homedir(), ".config", "opencode", "opencode.json"),
-    ];
-    for (const configPath of paths) {
+    this.settingsPath = undefined;
+    const configPaths = this.paths();
+    const globalPaths = new Set(configPaths.filter(p => p.includes(homedir())));
+    let firstValidSettings: Record<string, unknown> | null = null;
+    let firstValidPath: string | undefined;
+
+    for (const configPath of configPaths) {
       try {
         const raw = readFileSync(configPath, "utf-8");
-        return JSON.parse(raw) as Record<string, unknown>;
+        const text = configPath.endsWith(".jsonc") ? stripJsonComments(raw) : raw;
+        const settings = JSON.parse(text) as Record<string, unknown>;
+
+        if (!firstValidSettings) {
+          firstValidSettings = settings;
+          firstValidPath = configPath;
+        }
+
+        const isGlobalConfig = globalPaths.has(configPath);
+
+        if (this.hasContextModePlugin(settings) || isGlobalConfig) {
+          this.settingsPath = configPath;
+          return settings;
+        }
       } catch {
         continue;
       }
+    }
+
+    if (firstValidSettings) {
+      this.settingsPath = firstValidPath;
+      return firstValidSettings;
     }
     return null;
   }
 
   writeSettings(settings: Record<string, unknown>): void {
-    // Write to opencode.json in current directory
-    const configPath = resolve("opencode.json");
+    // Write to opencode.json(c)/kilo.json(c) in current directory
     writeFileSync(
-      configPath,
+      this.getSettingsPath(),
       JSON.stringify(settings, null, 2) + "\n",
       "utf-8",
     );
@@ -300,16 +373,15 @@ export class OpenCodeAdapter implements HookAdapter {
       results.push({
         check: "Plugin configuration",
         status: "fail",
-        message: "Could not read opencode.json",
+        message: `Could not read ${this.platform}.json or ${this.platform}.jsonc`,
         fix: "context-mode upgrade",
       });
       return results;
     }
 
     // Check for "context-mode" in plugin array
-    const plugins = settings.plugin as string[] | undefined;
-    if (plugins && Array.isArray(plugins)) {
-      const hasPlugin = plugins.some((p) => p.includes("context-mode"));
+    const hasPlugin = this.hasContextModePlugin(settings);
+    if (Array.isArray(settings.plugin)) {
       results.push({
         check: "Plugin registration",
         status: hasPlugin ? "pass" : "fail",
@@ -324,7 +396,7 @@ export class OpenCodeAdapter implements HookAdapter {
       results.push({
         check: "Plugin registration",
         status: "fail",
-        message: "No plugin array found in opencode.json",
+        message: `No plugin array found in ${this.platform}.json or ${this.platform}.jsonc`,
         fix: "context-mode upgrade",
       });
     }
@@ -334,7 +406,7 @@ export class OpenCodeAdapter implements HookAdapter {
       check: "SessionStart hook",
       status: "warn",
       message:
-        "SessionStart not supported in OpenCode (see issues #14808, #5409)",
+        `SessionStart not supported in ${this.name} (see issues #14808, #5409)`,
     });
 
     return results;
@@ -346,26 +418,22 @@ export class OpenCodeAdapter implements HookAdapter {
       return {
         check: "Plugin registration",
         status: "warn",
-        message: "Could not read opencode.json",
+        message: `Could not read ${this.platform}.json or ${this.platform}.jsonc`,
       };
     }
 
-    const plugins = settings.plugin as string[] | undefined;
-    if (plugins && Array.isArray(plugins)) {
-      const hasPlugin = plugins.some((p) => p.includes("context-mode"));
-      if (hasPlugin) {
-        return {
-          check: "Plugin registration",
-          status: "pass",
-          message: "context-mode found in plugin array",
-        };
-      }
+    if (this.hasContextModePlugin(settings)) {
+      return {
+        check: "Plugin registration",
+        status: "pass",
+        message: "context-mode found in plugin array",
+      };
     }
 
     return {
       check: "Plugin registration",
       status: "fail",
-      message: "context-mode not found in opencode.json plugin array",
+      message: `context-mode not found in ${this.platform}.json plugin array`,
       fix: "context-mode upgrade",
     };
   }
@@ -376,7 +444,7 @@ export class OpenCodeAdapter implements HookAdapter {
       const pkgPath = resolve(
         homedir(),
         ".cache",
-        "opencode",
+        this.platform,
         "node_modules",
         "context-mode",
         "package.json",
@@ -410,22 +478,22 @@ export class OpenCodeAdapter implements HookAdapter {
   }
 
   backupSettings(): string | null {
-    const paths = [
-      resolve("opencode.json"),
-      resolve(".opencode", "opencode.json"),
-      join(homedir(), ".config", "opencode", "opencode.json"),
-    ];
-    for (const configPath of paths) {
+    const check = this.checkPluginRegistration();
+    
+    if (!this.settingsPath) return null;
+
+    if (check.status === "pass") {
+      return this.settingsPath;
+    } else {
       try {
-        accessSync(configPath, constants.R_OK);
-        const backupPath = configPath + ".bak";
-        copyFileSync(configPath, backupPath);
+        accessSync(this.settingsPath, constants.R_OK);
+        const backupPath = this.settingsPath + ".bak";
+        copyFileSync(this.settingsPath, backupPath);
         return backupPath;
-      } catch {
-        continue;
-      }
+      } catch { 
+        return null;
+       }
     }
-    return null;
   }
 
   setHookPermissions(_pluginRoot: string): string[] {
@@ -437,39 +505,15 @@ export class OpenCodeAdapter implements HookAdapter {
     // OpenCode manages plugins through npm/opencode.json — no separate registry
   }
 
-  // ── Routing Instructions (soft enforcement) ────────────
-
-  getRoutingInstructionsConfig(): RoutingInstructionsConfig {
-    return {
-      fileName: "AGENTS.md",
-      globalPath: resolve(homedir(), ".config", "opencode", "AGENTS.md"),
-      projectRelativePath: "AGENTS.md",
-    };
-  }
-
-  writeRoutingInstructions(projectDir: string, pluginRoot: string): string | null {
-    const config = this.getRoutingInstructionsConfig();
-    const targetPath = resolve(projectDir, config.projectRelativePath);
-    const sourcePath = resolve(pluginRoot, "configs", "opencode", config.fileName);
-
-    try {
-      const content = readFileSync(sourcePath, "utf-8");
-
-      try {
-        const existing = readFileSync(targetPath, "utf-8");
-        if (existing.includes("context-mode")) return null;
-        writeFileSync(targetPath, existing.trimEnd() + "\n\n" + content, "utf-8");
-        return targetPath;
-      } catch {
-        writeFileSync(targetPath, content, "utf-8");
-        return targetPath;
-      }
-    } catch {
-      return null;
-    }
-  }
-
   // ── Internal helpers ───────────────────────────────────
+
+  /**
+   * Check whether a settings object has the context-mode plugin registered.
+   */
+  private hasContextModePlugin(settings: Record<string, unknown>): boolean {
+    const plugins = settings.plugin;
+    return Array.isArray(plugins) && plugins.some((p: unknown) => typeof p === "string" && p.includes("context-mode"));
+  }
 
   /**
    * Extract session ID from OpenCode hook input.

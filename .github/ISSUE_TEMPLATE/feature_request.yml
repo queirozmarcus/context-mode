@@ -1,63 +1,62 @@
 name: Feature Request
-description: Suggest a feature — but consider opening a PR with a prototype instead.
+description: Suggest a feature or improvement
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        **PRs with working prototypes are reviewed faster than feature requests.**
+        **PRs are always welcome.** If you can implement the feature yourself (with help from your AI agent), a PR is the fastest path to getting it shipped.
 
-        If you have an idea, try building it. The codebase is straightforward TypeScript — your AI agent can help you prototype it in minutes. Open a PR with tests and a before/after comparison, and it will get merged fast.
-
-        Feature requests without a clear problem statement or proposed implementation will be deprioritized.
   - type: dropdown
     id: platform
     attributes:
       label: Platform
-      description: Which platform(s) does this feature apply to?
-      multiple: true
+      description: Which AI agent platform is this feature for?
       options:
-        - All platforms
         - Claude Code
+        - Cursor
+        - VS Code Copilot (GitHub Copilot)
         - Gemini CLI
-        - VS Code Copilot
         - OpenCode
+        - KiloCode
         - Codex CLI
+        - OpenClaw (Pi Agent)
+        - Kiro
+        - Antigravity
+        - Zed
+        - Other (please specify)
     validations:
       required: true
 
-  - type: input
-    id: version
+  - type: textarea
+    id: feature-description
     attributes:
-      label: context-mode version
+      label: Feature description
       description: |
-        Run `/context-mode:ctx-doctor` to check. Make sure you're on the latest before requesting -- it may already be implemented.
-        Also [search existing issues](https://github.com/mksglu/context-mode/issues) to avoid duplicates.
-      placeholder: "e.g. 0.9.23"
+        A clear and concise description of the feature you'd like to see.
+      placeholder: "Describe the feature..."
     validations:
       required: true
 
   - type: textarea
-    id: problem
+    id: use-case
     attributes:
-      label: Problem
-      description: What problem does this solve? What's the current limitation?
+      label: Use case
+      description: |
+        Why do you need this feature? What problem does it solve?
+        Describe the workflow or situation where this would be useful.
+      placeholder: "When I'm doing X, I need Y because..."
     validations:
       required: true
 
   - type: textarea
-    id: solution
+    id: proposed-solution
     attributes:
       label: Proposed solution
-      description: How should it work? Include example usage if possible.
-    validations:
-      required: true
-
-  - type: textarea
-    id: alternatives
-    attributes:
-      label: Alternatives considered
-      description: Any other approaches you've thought about?
+      description: |
+        If you have ideas on how this could be implemented, describe them here.
+        This is optional but helps us understand your vision.
+      placeholder: "One way to implement this could be..."
     validations:
       required: false

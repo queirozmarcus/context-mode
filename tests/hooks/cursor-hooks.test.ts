@@ -1,14 +1,16 @@
+import "../setup-home";
 /**
  * Hook Integration Tests — Cursor hooks
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { describe, test, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, rmSync, existsSync, unlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir, homedir } from "node:os";
+import { fakeHome, realHome } from "../setup-home";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOOKS_DIR = join(__dirname, "..", "..", "hooks", "cursor");
@@ -19,11 +21,12 @@ interface HookResult {
   stderr: string;
 }
 
-function runHook(hookFile: string, input: Record<string, unknown>, env?: Record<string, string>): HookResult {
+function runHook(hookFile: string, input: Record<string, unknown>, env?: Record<string, string>, { bom = false } = {}): HookResult {
+  const json = JSON.stringify(input);
   const result = spawnSync("node", [join(HOOKS_DIR, hookFile)], {
-    input: JSON.stringify(input),
+    input: bom ? "\uFEFF" + json : json,
     encoding: "utf-8",
-    timeout: 10000,
+    timeout: 30_000,
     env: { ...process.env, ...env },
   });
 
@@ -38,6 +41,7 @@ describe("Cursor hooks", () => {
   let tempDir: string;
   let dbPath: string;
   let eventsPath: string;
+  let realDbPath: string;
 
   beforeAll(() => {
     tempDir = mkdtempSync(join(tmpdir(), "cursor-hook-test-"));
@@ -45,6 +49,7 @@ describe("Cursor hooks", () => {
     const sessionsDir = join(homedir(), ".cursor", "context-mode", "sessions");
     dbPath = join(sessionsDir, `${hash}.db`);
     eventsPath = join(sessionsDir, `${hash}-events.md`);
+    realDbPath = join(realHome, ".cursor", "context-mode", "sessions", `${hash}.db`);
   });
 
   afterAll(() => {
@@ -52,6 +57,11 @@ describe("Cursor hooks", () => {
     try { if (existsSync(dbPath)) unlinkSync(dbPath); } catch { /* best effort */ }
     try { if (existsSync(eventsPath)) unlinkSync(eventsPath); } catch { /* best effort */ }
   });
+
+  // MCP readiness sentinel — subprocess hooks check process.ppid (= this test's pid)
+  const mcpSentinel = resolve(tmpdir(), `context-mode-mcp-ready-${process.pid}`);
+  beforeEach(() => { writeFileSync(mcpSentinel, String(process.pid)); });
+  afterEach(() => { try { unlinkSync(mcpSentinel); } catch {} });
 
   const cursorEnv = () => ({ CURSOR_CWD: tempDir });
 
@@ -116,7 +126,7 @@ describe("Cursor hooks", () => {
       expect(result.exitCode).toBe(0);
       const payload = JSON.parse(result.stdout) as Record<string, unknown>;
       expect(payload.permission).toBe("deny");
-      expect(String(payload.user_message)).toContain("mcp_web_fetch");
+      expect(String(payload.user_message)).toContain("WebFetch blocked");
       expect(String(payload.user_message)).toContain("ctx_fetch_and_index");
       expect(String(payload.user_message)).toContain("ctx_search");
     });
@@ -132,7 +142,7 @@ describe("Cursor hooks", () => {
       expect(result.exitCode).toBe(0);
       const payload = JSON.parse(result.stdout) as Record<string, unknown>;
       expect(payload.permission).toBe("deny");
-      expect(String(payload.user_message)).toContain("mcp_fetch_tool");
+      expect(String(payload.user_message)).toContain("WebFetch blocked");
       expect(String(payload.user_message)).toContain("ctx_fetch_and_index");
       expect(String(payload.user_message)).toContain("ctx_search");
     });
@@ -212,6 +222,52 @@ describe("Cursor hooks", () => {
     });
   });
 
+  describe("stop.mjs", () => {
+    test("exists on disk", () => {
+      expect(existsSync(join(HOOKS_DIR, "stop.mjs"))).toBe(true);
+    });
+
+    test("exits 0 and returns followup_message when given valid JSON stdin", () => {
+      const result = runHook("stop.mjs", {
+        conversation_id: "cursor-hook-stop-1",
+        status: "completed",
+        loop_count: 3,
+        transcript_path: `${tempDir}/transcripts/cursor-hook-stop-1.jsonl`,
+        workspace_roots: [tempDir],
+      }, cursorEnv());
+
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(payload.followup_message).toBe("");
+    });
+
+    test("handles error status gracefully", () => {
+      const result = runHook("stop.mjs", {
+        conversation_id: "cursor-hook-stop-2",
+        status: "error",
+        loop_count: 1,
+        workspace_roots: [tempDir],
+      }, cursorEnv());
+
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(payload.followup_message).toBe("");
+    });
+
+    test("parses BOM-prefixed stdin without error", () => {
+      const result = runHook("stop.mjs", {
+        conversation_id: "cursor-bom-stop-1",
+        status: "completed",
+        loop_count: 0,
+        workspace_roots: [tempDir],
+      }, cursorEnv(), { bom: true });
+
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(payload.followup_message).toBe("");
+    });
+  });
+
   describe("end-to-end flow", () => {
     test("captures tool events and restores on compact", () => {
       const sessionId = "cursor-hook-e2e";
@@ -234,6 +290,59 @@ describe("Cursor hooks", () => {
       expect(startResult.exitCode).toBe(0);
       const payload = JSON.parse(startResult.stdout) as Record<string, unknown>;
       expect(String(payload.additional_context)).toContain("session_knowledge");
+    });
+
+    test("spawned hook writes stay under fake HOME", () => {
+      const result = runHook("posttooluse.mjs", {
+        tool_name: "Read",
+        tool_input: { file_path: "/src/app.ts" },
+        tool_output: "export default {}",
+        conversation_id: "cursor-hook-home-isolation",
+        cwd: tempDir,
+      }, cursorEnv());
+
+      expect(result.exitCode).toBe(0);
+      expect(dbPath.startsWith(fakeHome)).toBe(true);
+      expect(existsSync(realDbPath)).toBe(false);
+    });
+  });
+
+  describe("UTF-8 BOM handling", () => {
+    test("pretooluse.mjs parses BOM-prefixed stdin without error", () => {
+      const result = runHook("pretooluse.mjs", {
+        tool_name: "Write",
+        tool_input: { file_path: `${tempDir}/test.md`, content: "hello" },
+        conversation_id: "cursor-bom-test-1",
+        workspace_roots: [tempDir],
+      }, {}, { bom: true });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("{\"agent_message\":\"\"}");
+    });
+
+    test("posttooluse.mjs parses BOM-prefixed stdin without error", () => {
+      const result = runHook("posttooluse.mjs", {
+        tool_name: "Shell",
+        tool_input: { command: "echo ok" },
+        tool_output: "ok",
+        conversation_id: "cursor-bom-test-2",
+        cwd: tempDir,
+      }, cursorEnv(), { bom: true });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("{\"additional_context\":\"\"}");
+    });
+
+    test("sessionstart.mjs parses BOM-prefixed stdin without error", () => {
+      const result = runHook("sessionstart.mjs", {
+        source: "startup",
+        conversation_id: "cursor-bom-test-3",
+        cwd: tempDir,
+      }, cursorEnv(), { bom: true });
+
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(String(payload.additional_context)).toContain("context-mode");
     });
   });
 });

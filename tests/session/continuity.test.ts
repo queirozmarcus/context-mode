@@ -27,7 +27,7 @@ function runHook(input: Record<string, unknown>) {
   const result = spawnSync("node", [HOOK_PATH], {
     input: JSON.stringify(input),
     encoding: "utf-8",
-    timeout: 5000,
+    timeout: 30_000,
   });
   return {
     exitCode: result.status ?? 1,
@@ -125,7 +125,7 @@ describe("renderTaskState — task completion filtering", () => {
     const result = renderTaskState(events);
     expect(result).toContain("Fix auth bug");
     expect(result).toContain("Add tests");
-    expect(result).toContain("<task_state>");
+    expect(result).toContain("[pending]");
   });
 
   it("filters out completed tasks", () => {

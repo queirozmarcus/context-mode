@@ -9,8 +9,9 @@
  * Verified env vars per platform (from source code audit):
  *   - Claude Code:    CLAUDE_PROJECT_DIR, CLAUDE_SESSION_ID | ~/.claude/
  *   - Gemini CLI:     GEMINI_PROJECT_DIR (hooks), GEMINI_CLI (MCP) | ~/.gemini/
+ *   - KiloCode:       KILO, KILO_PID | ~/.config/kilo/
  *   - OpenCode:       OPENCODE, OPENCODE_PID | ~/.config/opencode/
- *   - OpenClaw:       OPENCLAW_HOME, OPENCLAW_PROJECT_DIR | ~/.openclaw/
+ *   - OpenClaw:       OPENCLAW_HOME, OPENCLAW_CLI | ~/.openclaw/
  *   - Codex CLI:      CODEX_CI, CODEX_THREAD_ID | ~/.codex/
  *   - Cursor:         CURSOR_TRACE_ID (MCP), CURSOR_CLI (terminal) | ~/.cursor/
  *   - VS Code Copilot: VSCODE_PID, VSCODE_CWD | ~/.vscode/
@@ -46,8 +47,8 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
   const platformOverride = process.env.CONTEXT_MODE_PLATFORM;
   if (platformOverride) {
     const validPlatforms: PlatformId[] = [
-      "claude-code", "gemini-cli", "opencode", "codex",
-      "vscode-copilot", "cursor", "antigravity", "kiro",
+      "claude-code", "gemini-cli", "kilo", "opencode", "codex",
+      "vscode-copilot", "cursor", "antigravity", "kiro", "pi", "zed",
     ];
     if (validPlatforms.includes(platformOverride as PlatformId)) {
       return {
@@ -76,11 +77,19 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
     };
   }
 
-  if (process.env.OPENCLAW_HOME || process.env.OPENCLAW_PROJECT_DIR) {
+  if (process.env.OPENCLAW_HOME || process.env.OPENCLAW_CLI) {
     return {
       platform: "openclaw",
       confidence: "high",
-      reason: "OPENCLAW_HOME or OPENCLAW_PROJECT_DIR env var set",
+      reason: "OPENCLAW_HOME or OPENCLAW_CLI env var set",
+    };
+  }
+
+  if (process.env.KILO || process.env.KILO_PID) {
+    return {
+      platform: "kilo",
+      confidence: "high",
+      reason: "KILO or KILO_PID env var set",
     };
   }
 
@@ -152,6 +161,22 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
     };
   }
 
+  if (existsSync(resolve(home, ".kiro"))) {
+    return {
+      platform: "kiro",
+      confidence: "medium",
+      reason: "~/.kiro/ directory exists",
+    };
+  }
+
+  if (existsSync(resolve(home, ".pi"))) {
+    return {
+      platform: "pi",
+      confidence: "medium",
+      reason: "~/.pi/ directory exists",
+    };
+  }
+
   if (existsSync(resolve(home, ".openclaw"))) {
     return {
       platform: "openclaw",
@@ -160,11 +185,27 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
     };
   }
 
+  if (existsSync(resolve(home, ".config", "kilo"))) {
+    return {
+      platform: "kilo",
+      confidence: "medium",
+      reason: "~/.config/kilo/ directory exists",
+    };
+  }
+
   if (existsSync(resolve(home, ".config", "opencode"))) {
     return {
       platform: "opencode",
       confidence: "medium",
       reason: "~/.config/opencode/ directory exists",
+    };
+  }
+
+  if (existsSync(resolve(home, ".config", "zed"))) {
+    return {
+      platform: "zed",
+      confidence: "medium",
+      reason: "~/.config/zed/ directory exists",
     };
   }
 
@@ -195,9 +236,10 @@ export async function getAdapter(platform?: PlatformId): Promise<HookAdapter> {
       return new GeminiCLIAdapter();
     }
 
+    case "kilo":
     case "opencode": {
       const { OpenCodeAdapter } = await import("./opencode/index.js");
-      return new OpenCodeAdapter();
+      return new OpenCodeAdapter(target);
     }
 
     case "openclaw": {
@@ -228,6 +270,11 @@ export async function getAdapter(platform?: PlatformId): Promise<HookAdapter> {
     case "kiro": {
       const { KiroAdapter } = await import("./kiro/index.js");
       return new KiroAdapter();
+    }
+
+    case "zed": {
+      const { ZedAdapter } = await import("./zed/index.js");
+      return new ZedAdapter();
     }
 
     default: {

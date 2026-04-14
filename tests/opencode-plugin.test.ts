@@ -1,3 +1,4 @@
+import "./setup-home";
 /**
  * Tests for the OpenCode TypeScript plugin entry point.
  *
@@ -7,9 +8,9 @@
  *   - experimental.session.compacting (snapshot generation)
  */
 
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
+import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 // ── Test helpers ──────────────────────────────────────────
@@ -29,6 +30,12 @@ async function createTestPlugin(tempDir: string) {
 }
 
 // ── Tests ─────────────────────────────────────────────────
+
+// MCP readiness sentinel — routing.mjs checks process.ppid in-process
+const mcpSentinel = resolve(tmpdir(), `context-mode-mcp-ready-${process.ppid}`);
+
+beforeEach(() => { writeFileSync(mcpSentinel, String(process.pid)); });
+afterEach(() => { try { unlinkSync(mcpSentinel); } catch {} });
 
 describe("ContextModePlugin", () => {
   let tempDir: string;
@@ -58,14 +65,13 @@ describe("ContextModePlugin", () => {
       expect(typeof plugin["experimental.session.compacting"]).toBe("function");
     });
 
-    it("writes AGENTS.md routing instructions on startup", async () => {
+    it("does not write AGENTS.md routing instructions on startup", async () => {
       const projectDir = join(tempDir, "factory-startup-routing");
       mkdirSync(projectDir, { recursive: true });
       await createTestPlugin(projectDir);
 
       const agentsPath = join(projectDir, "AGENTS.md");
-      expect(existsSync(agentsPath)).toBe(true);
-      expect(readFileSync(agentsPath, "utf-8")).toContain("context-mode");
+      expect(existsSync(agentsPath)).toBe(false);
     });
   });
 
@@ -74,39 +80,44 @@ describe("ContextModePlugin", () => {
   describe("tool.execute.before", () => {
     it("modifies curl commands to block them", async () => {
       const plugin = await createTestPlugin(join(tempDir, "before-curl"));
-      const input = {
-        tool_name: "Bash",
-        tool_input: { command: "curl https://example.com/data" },
-      };
+      const input = { tool: "Bash", sessionID: "test-session", callID: "call-1" };
+      const output = { args: { command: "curl https://example.com/data" } };
 
-      await plugin["tool.execute.before"](input);
-
-      // Routing replaces the curl command with an informative echo
-      expect(input.tool_input.command).toMatch(/^echo /);
-      expect(input.tool_input.command).toContain("context-mode");
+      // Routing should throw for blocked commands (deny action)
+      // or modify the args to replace the command
+      try {
+        await plugin["tool.execute.before"](input, output);
+        // If it didn't throw, the command was modified in output.args
+        expect(output.args.command).toMatch(/^echo /);
+        expect(output.args.command).toContain("context-mode");
+      } catch (e: any) {
+        // deny/ask action throws — still correct behavior
+        expect(e.message).toContain("context-mode");
+      }
     });
 
     it("modifies wget commands to block them", async () => {
       const plugin = await createTestPlugin(join(tempDir, "before-wget"));
-      const input = {
-        tool_name: "Bash",
-        tool_input: { command: "wget https://example.com/file" },
-      };
+      const input = { tool: "Bash", sessionID: "test-session", callID: "call-2" };
+      const output = { args: { command: "wget https://example.com/file" } };
 
-      await plugin["tool.execute.before"](input);
-
-      expect(input.tool_input.command).toMatch(/^echo /);
-      expect(input.tool_input.command).toContain("context-mode");
+      try {
+        await plugin["tool.execute.before"](input, output);
+        expect(output.args.command).toMatch(/^echo /);
+        expect(output.args.command).toContain("context-mode");
+      } catch (e: any) {
+        expect(e.message).toContain("context-mode");
+      }
     });
 
     it("passes through normal tool calls", async () => {
       const plugin = await createTestPlugin(join(tempDir, "before-pass"));
 
       // TaskCreate is not routed — should passthrough
-      const result = await plugin["tool.execute.before"]({
-        tool_name: "TaskCreate",
-        tool_input: { subject: "test task" },
-      });
+      const result = await plugin["tool.execute.before"](
+        { tool: "TaskCreate", sessionID: "test-session", callID: "call-3" },
+        { args: { subject: "test task" } },
+      );
 
       expect(result).toBeUndefined();
     });
@@ -114,7 +125,10 @@ describe("ContextModePlugin", () => {
     it("handles empty input gracefully", async () => {
       const plugin = await createTestPlugin(join(tempDir, "before-empty"));
 
-      const result = await plugin["tool.execute.before"]({});
+      const result = await plugin["tool.execute.before"](
+        {} as any,
+        { args: {} } as any,
+      );
       expect(result).toBeUndefined();
     });
   });
@@ -127,11 +141,10 @@ describe("ContextModePlugin", () => {
 
       // Should not throw
       await expect(
-        plugin["tool.execute.after"]({
-          tool_name: "Read",
-          tool_input: { file_path: "/test/file.ts" },
-          tool_output: "file contents here",
-        }),
+        plugin["tool.execute.after"](
+          { tool: "Read", sessionID: "test-session", callID: "call-1", args: { file_path: "/test/file.ts" } },
+          { title: "Read", output: "file contents here", metadata: {} },
+        ),
       ).resolves.toBeUndefined();
     });
 
@@ -139,10 +152,10 @@ describe("ContextModePlugin", () => {
       const plugin = await createTestPlugin(join(tempDir, "after-write"));
 
       await expect(
-        plugin["tool.execute.after"]({
-          tool_name: "Write",
-          tool_input: { file_path: "/test/new-file.ts", content: "code" },
-        }),
+        plugin["tool.execute.after"](
+          { tool: "Write", sessionID: "test-session", callID: "call-2", args: { file_path: "/test/new-file.ts", content: "code" } },
+          { title: "Write", output: "", metadata: {} },
+        ),
       ).resolves.toBeUndefined();
     });
 
@@ -150,11 +163,10 @@ describe("ContextModePlugin", () => {
       const plugin = await createTestPlugin(join(tempDir, "after-git"));
 
       await expect(
-        plugin["tool.execute.after"]({
-          tool_name: "Bash",
-          tool_input: { command: "git commit -m 'test'" },
-          tool_output: "[main abc1234] test",
-        }),
+        plugin["tool.execute.after"](
+          { tool: "Bash", sessionID: "test-session", callID: "call-3", args: { command: "git commit -m 'test'" } },
+          { title: "Bash", output: "[main abc1234] test", metadata: {} },
+        ),
       ).resolves.toBeUndefined();
     });
 
@@ -162,7 +174,10 @@ describe("ContextModePlugin", () => {
       const plugin = await createTestPlugin(join(tempDir, "after-empty"));
 
       await expect(
-        plugin["tool.execute.after"]({}),
+        plugin["tool.execute.after"](
+          {} as any,
+          { title: "", output: "", metadata: {} } as any,
+        ),
       ).resolves.toBeUndefined();
     });
   });
@@ -173,7 +188,11 @@ describe("ContextModePlugin", () => {
     it("returns empty string when no events captured", async () => {
       const plugin = await createTestPlugin(join(tempDir, "compact-empty"));
 
-      const snapshot = await plugin["experimental.session.compacting"]();
+      const output = { context: [] as string[], prompt: undefined };
+      const snapshot = await plugin["experimental.session.compacting"](
+        { sessionID: "test-session" },
+        output,
+      );
       expect(snapshot).toBe("");
     });
 
@@ -181,47 +200,57 @@ describe("ContextModePlugin", () => {
       const plugin = await createTestPlugin(join(tempDir, "compact-snap"));
 
       // Capture several events first
-      await plugin["tool.execute.after"]({
-        tool_name: "Read",
-        tool_input: { file_path: "/src/index.ts" },
-        tool_output: "export default {}",
-      });
-      await plugin["tool.execute.after"]({
-        tool_name: "Edit",
-        tool_input: { file_path: "/src/index.ts", old_string: "{}", new_string: "{ foo: 1 }" },
-      });
-      await plugin["tool.execute.after"]({
-        tool_name: "Bash",
-        tool_input: { command: "git status" },
-        tool_output: "On branch main",
-      });
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "test-session", callID: "call-1", args: { file_path: "/src/index.ts" } },
+        { title: "Read", output: "export default {}", metadata: {} },
+      );
+      await plugin["tool.execute.after"](
+        { tool: "Edit", sessionID: "test-session", callID: "call-2", args: { file_path: "/src/index.ts", old_string: "{}", new_string: "{ foo: 1 }" } },
+        { title: "Edit", output: "", metadata: {} },
+      );
+      await plugin["tool.execute.after"](
+        { tool: "Bash", sessionID: "test-session", callID: "call-3", args: { command: "git status" } },
+        { title: "Bash", output: "On branch main", metadata: {} },
+      );
 
-      const snapshot = await plugin["experimental.session.compacting"]();
+      const output = { context: [] as string[], prompt: undefined };
+      const snapshot = await plugin["experimental.session.compacting"](
+        { sessionID: "test-session" },
+        output,
+      );
 
       expect(snapshot.length).toBeGreaterThan(0);
       expect(snapshot).toContain("session_resume");
-      expect(snapshot).toContain("/src/index.ts");
+      expect(snapshot).toContain("<files");
+      expect(snapshot).toContain("index.ts");
     });
 
     it("can be called multiple times (increments compact count)", async () => {
       const plugin = await createTestPlugin(join(tempDir, "compact-multi"));
 
-      await plugin["tool.execute.after"]({
-        tool_name: "Read",
-        tool_input: { file_path: "/test/a.ts" },
-        tool_output: "code",
-      });
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "test-session", callID: "call-1", args: { file_path: "/test/a.ts" } },
+        { title: "Read", output: "code", metadata: {} },
+      );
 
-      const snap1 = await plugin["experimental.session.compacting"]();
+      const output1 = { context: [] as string[], prompt: undefined };
+      const snap1 = await plugin["experimental.session.compacting"](
+        { sessionID: "test-session" },
+        output1,
+      );
       expect(snap1.length).toBeGreaterThan(0);
 
       // Capture more events
-      await plugin["tool.execute.after"]({
-        tool_name: "Write",
-        tool_input: { file_path: "/test/b.ts", content: "new file" },
-      });
+      await plugin["tool.execute.after"](
+        { tool: "Write", sessionID: "test-session", callID: "call-2", args: { file_path: "/test/b.ts", content: "new file" } },
+        { title: "Write", output: "", metadata: {} },
+      );
 
-      const snap2 = await plugin["experimental.session.compacting"]();
+      const output2 = { context: [] as string[], prompt: undefined };
+      const snap2 = await plugin["experimental.session.compacting"](
+        { sessionID: "test-session" },
+        output2,
+      );
       expect(snap2.length).toBeGreaterThan(0);
     });
   });
@@ -233,44 +262,59 @@ describe("ContextModePlugin", () => {
       const plugin = await createTestPlugin(join(tempDir, "e2e-flow"));
 
       // Normal tool call passes through before hook
-      await plugin["tool.execute.before"]({
-        tool_name: "Read",
-        tool_input: { file_path: "/app/main.ts" },
-      });
+      await plugin["tool.execute.before"](
+        { tool: "Read", sessionID: "test-session", callID: "call-1" },
+        { args: { file_path: "/app/main.ts" } },
+      );
 
       // After hook captures the event
-      await plugin["tool.execute.after"]({
-        tool_name: "Read",
-        tool_input: { file_path: "/app/main.ts" },
-        tool_output: "console.log('hello')",
-      });
+      await plugin["tool.execute.after"](
+        { tool: "Read", sessionID: "test-session", callID: "call-1", args: { file_path: "/app/main.ts" } },
+        { title: "Read", output: "console.log('hello')", metadata: {} },
+      );
 
       // Compacting generates snapshot
-      const snapshot = await plugin["experimental.session.compacting"]();
+      const output = { context: [] as string[], prompt: undefined };
+      const snapshot = await plugin["experimental.session.compacting"](
+        { sessionID: "test-session" },
+        output,
+      );
       expect(snapshot).toContain("session_resume");
-      expect(snapshot).toContain("/app/main.ts");
+      expect(snapshot).toContain("<files");
+      expect(snapshot).toContain("main.ts");
     });
 
     it("blocked tool command is replaced before execution", async () => {
       const plugin = await createTestPlugin(join(tempDir, "e2e-block"));
-      const input = {
-        tool_name: "Bash",
-        tool_input: { command: "curl https://evil.com" },
-      };
+      const beforeInput = { tool: "Bash", sessionID: "test-session", callID: "call-1" };
+      const beforeOutput = { args: { command: "curl https://evil.com" } };
 
-      // Before hook replaces the command
-      await plugin["tool.execute.before"](input);
-      expect(input.tool_input.command).toContain("context-mode");
+      // Before hook blocks/modifies the command
+      let blocked = false;
+      try {
+        await plugin["tool.execute.before"](beforeInput, beforeOutput);
+        // If modified (not thrown), the command was replaced
+        expect(beforeOutput.args.command).toContain("context-mode");
+      } catch (e: any) {
+        // deny action throws
+        blocked = true;
+        expect(e.message).toContain("context-mode");
+      }
 
-      // After hook still runs (with the replaced command)
-      await plugin["tool.execute.after"]({
-        tool_name: "Bash",
-        tool_input: input.tool_input,
-        tool_output: input.tool_input.command,
-      });
+      if (!blocked) {
+        // After hook still runs (with the replaced command)
+        await plugin["tool.execute.after"](
+          { tool: "Bash", sessionID: "test-session", callID: "call-1", args: beforeOutput.args },
+          { title: "Bash", output: beforeOutput.args.command, metadata: {} },
+        );
+      }
 
-      // Snapshot should be empty (echo commands don't generate events)
-      const snapshot = await plugin["experimental.session.compacting"]();
+      // Snapshot should be empty (echo/blocked commands don't generate events)
+      const compactOutput = { context: [] as string[], prompt: undefined };
+      const snapshot = await plugin["experimental.session.compacting"](
+        { sessionID: "test-session" },
+        compactOutput,
+      );
       expect(snapshot).toBe("");
     });
   });

@@ -1,3 +1,4 @@
+import "../setup-home";
 import { describe, it, expect, beforeEach } from "vitest";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -150,9 +151,9 @@ describe("KiroAdapter", () => {
   // ── Config paths ──────────────────────────────────────
 
   describe("config paths", () => {
-    it("settings path is ~/.kiro/settings/mcp_config.json", () => {
+    it("settings path is ~/.kiro/settings/mcp.json", () => {
       expect(adapter.getSettingsPath()).toBe(
-        resolve(homedir(), ".kiro", "settings", "mcp_config.json"),
+        resolve(homedir(), ".kiro", "settings", "mcp.json"),
       );
     });
 
@@ -176,24 +177,4 @@ describe("KiroAdapter", () => {
     });
   });
 
-  // ── Routing Instructions ──────────────────────────────
-
-  describe("routing instructions", () => {
-    it("fileName is KIRO.md", () => {
-      const config = adapter.getRoutingInstructionsConfig();
-      expect(config.fileName).toBe("KIRO.md");
-    });
-
-    it("globalPath is ~/.kiro/KIRO.md", () => {
-      const config = adapter.getRoutingInstructionsConfig();
-      expect(config.globalPath).toBe(
-        resolve(homedir(), ".kiro", "KIRO.md"),
-      );
-    });
-
-    it("projectRelativePath is KIRO.md", () => {
-      const config = adapter.getRoutingInstructionsConfig();
-      expect(config.projectRelativePath).toBe("KIRO.md");
-    });
-  });
 });

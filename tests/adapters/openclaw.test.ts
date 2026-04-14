@@ -1,3 +1,4 @@
+import "../setup-home";
 import { describe, it, expect, beforeEach } from "vitest";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -76,7 +77,7 @@ describe("OpenClawAdapter", () => {
       expect(event.toolInput).toEqual({ command: "ls -la" });
     });
 
-    it("projectDir falls back to cwd when no OPENCLAW_PROJECT_DIR", () => {
+    it("projectDir falls back to cwd", () => {
       const event = adapter.parsePreToolUseInput({
         toolName: "shell",
       });
@@ -259,17 +260,6 @@ describe("OpenClawAdapter", () => {
       const eventsPath = adapter.getSessionEventsPath("/test/project");
       expect(eventsPath).toContain(".openclaw");
       expect(eventsPath).toMatch(/-events\.md$/);
-    });
-  });
-
-  // ── Routing instructions ──────────────────────────────
-
-  describe("routing instructions", () => {
-    it("returns AGENTS.md config", () => {
-      const config = adapter.getRoutingInstructionsConfig();
-      expect(config.fileName).toBe("AGENTS.md");
-      expect(config.projectRelativePath).toBe("AGENTS.md");
-      expect(config.globalPath).toContain(".openclaw");
     });
   });
 

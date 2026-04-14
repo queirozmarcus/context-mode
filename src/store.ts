@@ -9,9 +9,9 @@
  */
 
 import type { Database as DatabaseInstance } from "better-sqlite3";
-import { loadDatabase, applyWALPragmas } from "./db-base.js";
+import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, unlinkSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,6 +24,17 @@ interface Chunk {
   content: string;
   hasCode: boolean;
 }
+
+type SourceMatchMode = "like" | "exact";
+
+type SearchRow = {
+  title: string;
+  content: string;
+  content_type: string;
+  label: string;
+  rank: number;
+  highlighted: string;
+};
 
 import type { IndexResult, SearchResult, StoreStats } from "./types.js";
 export type { IndexResult, SearchResult, StoreStats } from "./types.js";
@@ -63,7 +74,14 @@ function sanitizeQuery(query: string, mode: "AND" | "OR" = "AND"): string {
     );
 
   if (words.length === 0) return '""';
-  return words.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
+
+  // Filter stopwords to improve BM25 ranking — common terms like "update",
+  // "test", "fix" appear everywhere and dilute relevance scoring.
+  // Fall back to unfiltered words if ALL terms are stopwords.
+  const meaningful = words.filter((w) => !STOPWORDS.has(w.toLowerCase()));
+  const final = meaningful.length > 0 ? meaningful : words;
+
+  return final.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
 }
 
 function sanitizeTrigramQuery(query: string, mode: "AND" | "OR" = "AND"): string {
@@ -71,7 +89,11 @@ function sanitizeTrigramQuery(query: string, mode: "AND" | "OR" = "AND"): string
   if (cleaned.length < 3) return "";
   const words = cleaned.split(/\s+/).filter((w) => w.length >= 3);
   if (words.length === 0) return "";
-  return words.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
+
+  const meaningful = words.filter((w) => !STOPWORDS.has(w.toLowerCase()));
+  const final = meaningful.length > 0 ? meaningful : words;
+
+  return final.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
 }
 
 function levenshtein(a: string, b: string): number {
@@ -133,6 +155,117 @@ export function cleanupStaleDBs(): number {
   return cleaned;
 }
 
+/**
+ * Check if a PID is still alive (not a zombie holding a WAL lock).
+ * Returns true if the process exists, false if it's dead.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Clean up stale per-project content store DBs older than maxAgeDays.
+ * Scans the given directory for *.db files and checks mtime.
+ * Also detects zombie processes holding WAL locks — if a WAL file exists
+ * but the owning PID is dead, the DB files are cleaned up regardless of age.
+ */
+export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): number {
+  let cleaned = 0;
+  try {
+    if (!existsSync(contentDir)) return 0;
+    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    const files = readdirSync(contentDir).filter(f => f.endsWith(".db"));
+    for (const file of files) {
+      try {
+        const filePath = join(contentDir, file);
+        const mtime = statSync(filePath).mtimeMs;
+        let shouldClean = mtime < cutoff;
+
+        // Detect zombie processes holding WAL locks:
+        // If a WAL file exists, try to read the WAL header to extract the PID.
+        // WAL files from dead processes can block new connections.
+        if (!shouldClean) {
+          const walPath = filePath + "-wal";
+          if (existsSync(walPath)) {
+            try {
+              const walStat = statSync(walPath);
+              // If WAL file is non-empty and DB hasn't been modified in >1 hour,
+              // the owning process may be dead — check via mtime staleness
+              if (walStat.size > 0 && (Date.now() - walStat.mtimeMs) > 3600_000) {
+                shouldClean = true;
+              }
+            } catch { /* ignore WAL check errors */ }
+          }
+        }
+
+        if (shouldClean) {
+          for (const suffix of ["", "-wal", "-shm"]) {
+            try { unlinkSync(filePath + suffix); } catch { /* ignore */ }
+          }
+          cleaned++;
+        }
+      } catch { /* ignore per-file errors */ }
+    }
+  } catch { /* ignore readdir errors */ }
+  return cleaned;
+}
+
+// ── Proximity helpers (pure functions) ──
+
+/** Find all positions of a term in text. */
+function findAllPositions(text: string, term: string): number[] {
+  const positions: number[] = [];
+  let idx = text.indexOf(term);
+  while (idx !== -1) {
+    positions.push(idx);
+    idx = text.indexOf(term, idx + 1);
+  }
+  return positions;
+}
+
+/**
+ * Find minimum span (window) covering at least one position from each list.
+ * Uses a sweep-line approach: advance the pointer at the current minimum.
+ */
+function findMinSpan(positionLists: number[][]): number {
+  if (positionLists.length === 0) return Infinity;
+  if (positionLists.length === 1) return 0;
+
+  const sorted = positionLists.map((p) => [...p].sort((a, b) => a - b));
+  const ptrs = new Array(sorted.length).fill(0);
+  let minSpan = Infinity;
+
+  while (true) {
+    let curMin = Infinity;
+    let curMax = -Infinity;
+    let minIdx = 0;
+
+    for (let i = 0; i < sorted.length; i++) {
+      const val = sorted[i][ptrs[i]];
+      if (val < curMin) {
+        curMin = val;
+        minIdx = i;
+      }
+      if (val > curMax) {
+        curMax = val;
+      }
+    }
+
+    const span = curMax - curMin;
+    if (span < minSpan) minSpan = span;
+
+    ptrs[minIdx]++;
+    if (ptrs[minIdx] >= sorted[minIdx].length) break;
+  }
+
+  return minSpan;
+}
+
 export class ContentStore {
   #db: DatabaseInstance;
   #dbPath: string;
@@ -156,9 +289,17 @@ export class ContentStore {
   // Search path (hot)
   #stmtSearchPorter!: PreparedStatement;
   #stmtSearchPorterFiltered!: PreparedStatement;
+  #stmtSearchPorterExact!: PreparedStatement;
   #stmtSearchTrigram!: PreparedStatement;
   #stmtSearchTrigramFiltered!: PreparedStatement;
+  #stmtSearchTrigramExact!: PreparedStatement;
   #stmtFuzzyVocab!: PreparedStatement;
+  #stmtSearchPorterContentType!: PreparedStatement;
+  #stmtSearchPorterFilteredContentType!: PreparedStatement;
+  #stmtSearchPorterExactContentType!: PreparedStatement;
+  #stmtSearchTrigramContentType!: PreparedStatement;
+  #stmtSearchTrigramFilteredContentType!: PreparedStatement;
+  #stmtSearchTrigramExactContentType!: PreparedStatement;
 
   // Read path
   #stmtListSources!: PreparedStatement;
@@ -166,13 +307,46 @@ export class ContentStore {
   #stmtSourceChunkCount!: PreparedStatement;
   #stmtChunkContent!: PreparedStatement;
   #stmtStats!: PreparedStatement;
+  #stmtSourceMeta!: PreparedStatement;
+
+  // Cleanup path
+  #stmtCleanupChunks!: PreparedStatement;
+  #stmtCleanupChunksTrigram!: PreparedStatement;
+  #stmtCleanupSources!: PreparedStatement;
+
+  // FTS5 optimization: track inserts and optimize periodically to defragment
+  // the index. FTS5 b-trees fragment over many insert/delete cycles, degrading
+  // search performance. SQLite's built-in 'optimize' merges b-tree segments.
+  #insertCount = 0;
+  static readonly OPTIMIZE_EVERY = 50;
 
   constructor(dbPath?: string) {
     const Database = loadDatabase();
     this.#dbPath =
       dbPath ?? join(tmpdir(), `context-mode-${process.pid}.db`);
-    this.#db = new Database(this.#dbPath, { timeout: 5000 });
-    applyWALPragmas(this.#db);
+    cleanOrphanedWALFiles(this.#dbPath);
+    let db: DatabaseInstance;
+    try {
+      db = new Database(this.#dbPath, { timeout: 30000 });
+      applyWALPragmas(db);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isSQLiteCorruptionError(msg)) {
+        deleteDBFiles(this.#dbPath);
+        cleanOrphanedWALFiles(this.#dbPath);
+        try {
+          db = new Database(this.#dbPath, { timeout: 30000 });
+          applyWALPragmas(db);
+        } catch (retryErr) {
+          throw new Error(
+            `Failed to create fresh DB after deleting corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
+          );
+        }
+      } else {
+        throw err;
+      }
+    }
+    this.#db = db;
     this.#initSchema();
     this.#prepareStatements();
   }
@@ -218,6 +392,8 @@ export class ContentStore {
       CREATE TABLE IF NOT EXISTS vocabulary (
         word TEXT PRIMARY KEY
       );
+
+      CREATE INDEX IF NOT EXISTS idx_sources_label ON sources(label);
     `);
   }
 
@@ -258,7 +434,7 @@ export class ContentStore {
         chunks.content,
         chunks.content_type,
         sources.label,
-        bm25(chunks, 2.0, 1.0) AS rank,
+        bm25(chunks, 5.0, 1.0) AS rank,
         highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
@@ -272,11 +448,25 @@ export class ContentStore {
         chunks.content,
         chunks.content_type,
         sources.label,
-        bm25(chunks, 2.0, 1.0) AS rank,
+        bm25(chunks, 5.0, 1.0) AS rank,
         highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND sources.label LIKE ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+    this.#stmtSearchPorterExact = this.#db.prepare(`
+      SELECT
+        chunks.title,
+        chunks.content,
+        chunks.content_type,
+        sources.label,
+        bm25(chunks, 5.0, 1.0) AS rank,
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
+      FROM chunks
+      JOIN sources ON sources.id = chunks.source_id
+      WHERE chunks MATCH ? AND sources.label = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -286,7 +476,7 @@ export class ContentStore {
         chunks_trigram.content,
         chunks_trigram.content_type,
         sources.label,
-        bm25(chunks_trigram, 2.0, 1.0) AS rank,
+        bm25(chunks_trigram, 5.0, 1.0) AS rank,
         highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
@@ -300,11 +490,111 @@ export class ContentStore {
         chunks_trigram.content,
         chunks_trigram.content_type,
         sources.label,
-        bm25(chunks_trigram, 2.0, 1.0) AS rank,
+        bm25(chunks_trigram, 5.0, 1.0) AS rank,
         highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label LIKE ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+    this.#stmtSearchTrigramExact = this.#db.prepare(`
+      SELECT
+        chunks_trigram.title,
+        chunks_trigram.content,
+        chunks_trigram.content_type,
+        sources.label,
+        bm25(chunks_trigram, 5.0, 1.0) AS rank,
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+      FROM chunks_trigram
+      JOIN sources ON sources.id = chunks_trigram.source_id
+      WHERE chunks_trigram MATCH ? AND sources.label = ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+
+    // Content-type filtered variants
+    this.#stmtSearchPorterContentType = this.#db.prepare(`
+      SELECT
+        chunks.title,
+        chunks.content,
+        chunks.content_type,
+        sources.label,
+        bm25(chunks, 5.0, 1.0) AS rank,
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
+      FROM chunks
+      JOIN sources ON sources.id = chunks.source_id
+      WHERE chunks MATCH ? AND chunks.content_type = ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+    this.#stmtSearchPorterFilteredContentType = this.#db.prepare(`
+      SELECT
+        chunks.title,
+        chunks.content,
+        chunks.content_type,
+        sources.label,
+        bm25(chunks, 5.0, 1.0) AS rank,
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
+      FROM chunks
+      JOIN sources ON sources.id = chunks.source_id
+      WHERE chunks MATCH ? AND sources.label LIKE ? AND chunks.content_type = ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+    this.#stmtSearchPorterExactContentType = this.#db.prepare(`
+      SELECT
+        chunks.title,
+        chunks.content,
+        chunks.content_type,
+        sources.label,
+        bm25(chunks, 5.0, 1.0) AS rank,
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
+      FROM chunks
+      JOIN sources ON sources.id = chunks.source_id
+      WHERE chunks MATCH ? AND sources.label = ? AND chunks.content_type = ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+    this.#stmtSearchTrigramContentType = this.#db.prepare(`
+      SELECT
+        chunks_trigram.title,
+        chunks_trigram.content,
+        chunks_trigram.content_type,
+        sources.label,
+        bm25(chunks_trigram, 5.0, 1.0) AS rank,
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+      FROM chunks_trigram
+      JOIN sources ON sources.id = chunks_trigram.source_id
+      WHERE chunks_trigram MATCH ? AND chunks_trigram.content_type = ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+    this.#stmtSearchTrigramFilteredContentType = this.#db.prepare(`
+      SELECT
+        chunks_trigram.title,
+        chunks_trigram.content,
+        chunks_trigram.content_type,
+        sources.label,
+        bm25(chunks_trigram, 5.0, 1.0) AS rank,
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+      FROM chunks_trigram
+      JOIN sources ON sources.id = chunks_trigram.source_id
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? AND chunks_trigram.content_type = ?
+      ORDER BY rank
+      LIMIT ?
+    `);
+    this.#stmtSearchTrigramExactContentType = this.#db.prepare(`
+      SELECT
+        chunks_trigram.title,
+        chunks_trigram.content,
+        chunks_trigram.content_type,
+        sources.label,
+        bm25(chunks_trigram, 5.0, 1.0) AS rank,
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+      FROM chunks_trigram
+      JOIN sources ON sources.id = chunks_trigram.source_id
+      WHERE chunks_trigram MATCH ? AND sources.label = ? AND chunks_trigram.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -331,12 +621,26 @@ export class ContentStore {
     this.#stmtChunkContent = this.#db.prepare(
       "SELECT content FROM chunks WHERE source_id = ?",
     );
+    this.#stmtSourceMeta = this.#db.prepare(
+      "SELECT label, chunk_count, code_chunk_count, indexed_at FROM sources WHERE label = ?",
+    );
     this.#stmtStats = this.#db.prepare(`
       SELECT
         (SELECT COUNT(*) FROM sources) AS sources,
         (SELECT COUNT(*) FROM chunks) AS chunks,
         (SELECT COUNT(*) FROM chunks WHERE content_type = 'code') AS codeChunks
     `);
+
+    // Cleanup path — cached to avoid recompiling SQL on each periodic call
+    this.#stmtCleanupChunks = this.#db.prepare(
+      "DELETE FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
+    );
+    this.#stmtCleanupChunksTrigram = this.#db.prepare(
+      "DELETE FROM chunks_trigram WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
+    );
+    this.#stmtCleanupSources = this.#db.prepare(
+      "DELETE FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days')",
+    );
   }
 
   // ── Index ──
@@ -356,7 +660,7 @@ export class ContentStore {
     const label = source ?? path ?? "untitled";
     const chunks = this.#chunkMarkdown(text);
 
-    return this.#insertChunks(chunks, label, text);
+    return withRetry(() => this.#insertChunks(chunks, label, text));
   }
 
   // ── Index Plain Text ──
@@ -377,11 +681,11 @@ export class ContentStore {
 
     const chunks = this.#chunkPlainText(content, linesPerChunk);
 
-    return this.#insertChunks(
+    return withRetry(() => this.#insertChunks(
       chunks.map((c) => ({ ...c, hasCode: false })),
       source,
       content,
-    );
+    ));
   }
 
   // ── Index JSON ──
@@ -416,7 +720,7 @@ export class ContentStore {
       return this.indexPlainText(content, source);
     }
 
-    return this.#insertChunks(chunks, source, content);
+    return withRetry(() => this.#insertChunks(chunks, source, content));
   }
 
   // ── Shared DB Insertion ──
@@ -457,6 +761,15 @@ export class ContentStore {
     const sourceId = transaction();
     if (text) this.#extractAndStoreVocabulary(text);
 
+    // Periodically optimize FTS5 indexes to merge b-tree segments.
+    // Fragmentation accumulates over insert/delete cycles (dedup re-indexes
+    // every source on update). The 'optimize' command merges segments into
+    // a single b-tree, improving search latency for long-running sessions.
+    this.#insertCount++;
+    if (this.#insertCount % ContentStore.OPTIMIZE_EVERY === 0) {
+      this.#optimizeFTS();
+    }
+
     return {
       sourceId,
       label,
@@ -467,25 +780,7 @@ export class ContentStore {
 
   // ── Search ──
 
-  search(query: string, limit: number = 3, source?: string, mode: "AND" | "OR" = "AND"): SearchResult[] {
-    const sanitized = sanitizeQuery(query, mode);
-
-    const stmt = source
-      ? this.#stmtSearchPorterFiltered
-      : this.#stmtSearchPorter;
-    const params = source
-      ? [sanitized, `%${source}%`, limit]
-      : [sanitized, limit];
-
-    const rows = stmt.all(...params) as Array<{
-      title: string;
-      content: string;
-      content_type: string;
-      label: string;
-      rank: number;
-      highlighted: string;
-    }>;
-
+  #mapSearchRows(rows: SearchRow[]): SearchResult[] {
     return rows.map((r) => ({
       title: r.title,
       content: r.content,
@@ -496,6 +791,44 @@ export class ContentStore {
     }));
   }
 
+  #sourceFilterParam(source: string, sourceMatchMode: SourceMatchMode): string {
+    return sourceMatchMode === "exact" ? source : `%${source}%`;
+  }
+
+  search(
+    query: string,
+    limit: number = 3,
+    source?: string,
+    mode: "AND" | "OR" = "AND",
+    contentType?: "code" | "prose",
+    sourceMatchMode: SourceMatchMode = "like",
+  ): SearchResult[] {
+    const sanitized = sanitizeQuery(query, mode);
+
+    let stmt: PreparedStatement;
+    let params: unknown[];
+
+    if (source && contentType) {
+      stmt = sourceMatchMode === "exact"
+        ? this.#stmtSearchPorterExactContentType
+        : this.#stmtSearchPorterFilteredContentType;
+      params = [sanitized, this.#sourceFilterParam(source, sourceMatchMode), contentType, limit];
+    } else if (source) {
+      stmt = sourceMatchMode === "exact"
+        ? this.#stmtSearchPorterExact
+        : this.#stmtSearchPorterFiltered;
+      params = [sanitized, this.#sourceFilterParam(source, sourceMatchMode), limit];
+    } else if (contentType) {
+      stmt = this.#stmtSearchPorterContentType;
+      params = [sanitized, contentType, limit];
+    } else {
+      stmt = this.#stmtSearchPorter;
+      params = [sanitized, limit];
+    }
+
+    return withRetry(() => this.#mapSearchRows(stmt.all(...params) as SearchRow[]));
+  }
+
   // ── Trigram Search (Layer 2) ──
 
   searchTrigram(
@@ -503,34 +836,34 @@ export class ContentStore {
     limit: number = 3,
     source?: string,
     mode: "AND" | "OR" = "AND",
+    contentType?: "code" | "prose",
+    sourceMatchMode: SourceMatchMode = "like",
   ): SearchResult[] {
     const sanitized = sanitizeTrigramQuery(query, mode);
     if (!sanitized) return [];
 
-    const stmt = source
-      ? this.#stmtSearchTrigramFiltered
-      : this.#stmtSearchTrigram;
-    const params = source
-      ? [sanitized, `%${source}%`, limit]
-      : [sanitized, limit];
+    let stmt: PreparedStatement;
+    let params: unknown[];
 
-    const rows = stmt.all(...params) as Array<{
-      title: string;
-      content: string;
-      content_type: string;
-      label: string;
-      rank: number;
-      highlighted: string;
-    }>;
+    if (source && contentType) {
+      stmt = sourceMatchMode === "exact"
+        ? this.#stmtSearchTrigramExactContentType
+        : this.#stmtSearchTrigramFilteredContentType;
+      params = [sanitized, this.#sourceFilterParam(source, sourceMatchMode), contentType, limit];
+    } else if (source) {
+      stmt = sourceMatchMode === "exact"
+        ? this.#stmtSearchTrigramExact
+        : this.#stmtSearchTrigramFiltered;
+      params = [sanitized, this.#sourceFilterParam(source, sourceMatchMode), limit];
+    } else if (contentType) {
+      stmt = this.#stmtSearchTrigramContentType;
+      params = [sanitized, contentType, limit];
+    } else {
+      stmt = this.#stmtSearchTrigram;
+      params = [sanitized, limit];
+    }
 
-    return rows.map((r) => ({
-      title: r.title,
-      content: r.content,
-      source: r.label,
-      rank: r.rank,
-      contentType: r.content_type as "code" | "prose",
-      highlighted: r.highlighted,
-    }));
+    return withRetry(() => this.#mapSearchRows(stmt.all(...params) as SearchRow[]));
   }
 
   // ── Fuzzy Correction (Layer 3) ──
@@ -561,69 +894,127 @@ export class ContentStore {
     return bestDist <= maxDist ? bestWord : null;
   }
 
+  // ── Reciprocal Rank Fusion (Cormack et al. 2009) ──
+
+  #rrfSearch(
+    query: string,
+    limit: number,
+    source?: string,
+    contentType?: "code" | "prose",
+    sourceMatchMode: SourceMatchMode = "like",
+  ): SearchResult[] {
+    const K = 60; // Standard RRF constant
+    const fetchLimit = Math.max(limit * 2, 10);
+
+    const porterResults = this.search(query, fetchLimit, source, "OR", contentType, sourceMatchMode);
+    const trigramResults = this.searchTrigram(query, fetchLimit, source, "OR", contentType, sourceMatchMode);
+
+    const scoreMap = new Map<string, { result: SearchResult; score: number }>();
+    const key = (r: SearchResult) => `${r.source}::${r.title}`;
+
+    for (const [i, r] of porterResults.entries()) {
+      const k = key(r);
+      const existing = scoreMap.get(k);
+      if (existing) {
+        existing.score += 1 / (K + i + 1);
+      } else {
+        scoreMap.set(k, { result: r, score: 1 / (K + i + 1) });
+      }
+    }
+
+    for (const [i, r] of trigramResults.entries()) {
+      const k = key(r);
+      const existing = scoreMap.get(k);
+      if (existing) {
+        existing.score += 1 / (K + i + 1);
+      } else {
+        scoreMap.set(k, { result: r, score: 1 / (K + i + 1) });
+      }
+    }
+
+    return Array.from(scoreMap.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map(({ result, score }) => ({ ...result, rank: -score }));
+  }
+
+  // ── Proximity Reranking ──
+
+  #applyProximityReranking(
+    results: SearchResult[],
+    query: string,
+  ): SearchResult[] {
+    const allTerms = query
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length >= 2);
+    // Exclude stopwords from proximity/title scoring — they match everywhere
+    // and inflate boosts for irrelevant chunks. Keep all terms as fallback.
+    const filtered = allTerms.filter((w) => !STOPWORDS.has(w));
+    const terms = filtered.length > 0 ? filtered : allTerms;
+
+    return results
+      .map((r) => {
+        // Title-match boost: query terms found in the chunk title get a boost.
+        // Code chunks get a stronger title boost (function/class names are high
+        // signal) while prose chunks get a moderate one (headings are useful but
+        // body carries more weight).
+        const titleLower = r.title.toLowerCase();
+        const titleHits = terms.filter((t) => titleLower.includes(t)).length;
+        const titleWeight = r.contentType === "code" ? 0.6 : 0.3;
+        const titleBoost = titleHits > 0 ? titleWeight * (titleHits / terms.length) : 0;
+
+        // Proximity boost for multi-term queries
+        let proximityBoost = 0;
+        if (terms.length >= 2) {
+          const content = r.content.toLowerCase();
+          const positions = terms.map((t) => findAllPositions(content, t));
+
+          if (!positions.some((p) => p.length === 0)) {
+            const minSpan = findMinSpan(positions);
+            proximityBoost = 1 / (1 + minSpan / Math.max(content.length, 1));
+          }
+        }
+
+        return { result: r, boost: titleBoost + proximityBoost };
+      })
+      .sort((a, b) => b.boost - a.boost || a.result.rank - b.result.rank)
+      .map(({ result }) => result);
+  }
+
   // ── Unified Fallback Search ──
 
   searchWithFallback(
     query: string,
     limit: number = 3,
     source?: string,
+    contentType?: "code" | "prose",
+    sourceMatchMode: SourceMatchMode = "like",
   ): SearchResult[] {
-    // Layer 1a: Porter + AND (most precise)
-    const porterAnd = this.search(query, limit, source, "AND");
-    if (porterAnd.length > 0) {
-      return porterAnd.map((r) => ({ ...r, matchLayer: "porter" as const }));
+    // Step 1: RRF fusion (porter OR + trigram OR → merge)
+    const rrfResults = this.#rrfSearch(query, limit, source, contentType, sourceMatchMode);
+    if (rrfResults.length > 0) {
+      const reranked = this.#applyProximityReranking(rrfResults, query);
+      return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
     }
 
-    // Layer 1b: Porter + OR (fallback when AND finds nothing)
-    const porterOr = this.search(query, limit, source, "OR");
-    if (porterOr.length > 0) {
-      return porterOr.map((r) => ({ ...r, matchLayer: "porter" as const }));
-    }
-
-    // Layer 2a: Trigram + AND
-    const trigramAnd = this.searchTrigram(query, limit, source, "AND");
-    if (trigramAnd.length > 0) {
-      return trigramAnd.map((r) => ({
-        ...r,
-        matchLayer: "trigram" as const,
-      }));
-    }
-
-    // Layer 2b: Trigram + OR
-    const trigramOr = this.searchTrigram(query, limit, source, "OR");
-    if (trigramOr.length > 0) {
-      return trigramOr.map((r) => ({
-        ...r,
-        matchLayer: "trigram" as const,
-      }));
-    }
-
-    // Layer 3: Fuzzy correction + re-search (AND then OR)
+    // Step 2: Fuzzy correction → RRF re-run
+    // Skip stopwords — they'll be filtered by sanitizeQuery anyway, and each
+    // fuzzyCorrect call hits the vocab DB + runs levenshtein comparisons.
     const words = query
       .toLowerCase()
       .trim()
       .split(/\s+/)
-      .filter((w) => w.length >= 3);
+      .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
     const original = words.join(" ");
     const correctedWords = words.map((w) => this.fuzzyCorrect(w) ?? w);
     const correctedQuery = correctedWords.join(" ");
 
     if (correctedQuery !== original) {
-      const fuzzyPorterAnd = this.search(correctedQuery, limit, source, "AND");
-      if (fuzzyPorterAnd.length > 0) {
-        return fuzzyPorterAnd.map((r) => ({ ...r, matchLayer: "fuzzy" as const }));
-      }
-      const fuzzyPorterOr = this.search(correctedQuery, limit, source, "OR");
-      if (fuzzyPorterOr.length > 0) {
-        return fuzzyPorterOr.map((r) => ({ ...r, matchLayer: "fuzzy" as const }));
-      }
-      const fuzzyTrigramAnd = this.searchTrigram(correctedQuery, limit, source, "AND");
-      if (fuzzyTrigramAnd.length > 0) {
-        return fuzzyTrigramAnd.map((r) => ({ ...r, matchLayer: "fuzzy" as const }));
-      }
-      const fuzzyTrigramOr = this.searchTrigram(correctedQuery, limit, source, "OR");
-      if (fuzzyTrigramOr.length > 0) {
-        return fuzzyTrigramOr.map((r) => ({ ...r, matchLayer: "fuzzy" as const }));
+      const fuzzyResults = this.#rrfSearch(correctedQuery, limit, source, contentType, sourceMatchMode);
+      if (fuzzyResults.length > 0) {
+        const reranked = this.#applyProximityReranking(fuzzyResults, correctedQuery);
+        return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
       }
     }
 
@@ -631,6 +1022,12 @@ export class ContentStore {
   }
 
   // ── Sources ──
+
+  getSourceMeta(label: string): { label: string; chunkCount: number; codeChunkCount: number; indexedAt: string } | null {
+    const row = this.#stmtSourceMeta.get(label) as { label: string; chunk_count: number; code_chunk_count: number; indexed_at: string } | undefined;
+    if (!row) return null;
+    return { label: row.label, chunkCount: row.chunk_count, codeChunkCount: row.code_chunk_count, indexedAt: row.indexed_at };
+  }
 
   listSources(): Array<{ label: string; chunkCount: number }> {
     return this.#stmtListSources.all() as Array<{
@@ -726,8 +1123,40 @@ export class ContentStore {
 
   // ── Cleanup ──
 
+  /**
+   * Delete sources (and their chunks) older than maxAgeDays.
+   * Returns count of deleted sources.
+   */
+  cleanupStaleSources(maxAgeDays: number): number {
+    const cleanup = this.#db.transaction((days: number) => {
+      this.#stmtCleanupChunks.run(days);
+      this.#stmtCleanupChunksTrigram.run(days);
+      return this.#stmtCleanupSources.run(days);
+    });
+    const info = cleanup(maxAgeDays);
+    return info.changes;
+  }
+
+  /** Get DB file size in bytes. */
+  getDBSizeBytes(): number {
+    try {
+      return statSync(this.#dbPath).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Merge FTS5 b-tree segments for both porter and trigram indexes. */
+  #optimizeFTS(): void {
+    try {
+      this.#db.exec("INSERT INTO chunks(chunks) VALUES('optimize')");
+      this.#db.exec("INSERT INTO chunks_trigram(chunks_trigram) VALUES('optimize')");
+    } catch { /* best effort — don't block indexing */ }
+  }
+
   close(): void {
-    this.#db.close();
+    this.#optimizeFTS(); // defragment before close
+    closeDB(this.#db); // WAL checkpoint before close — important for persistent DBs
   }
 
   // ── Vocabulary Extraction ──

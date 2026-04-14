@@ -1,21 +1,24 @@
 /**
  * adapters/codex — Codex CLI platform adapter.
  *
- * Implements HookAdapter for Codex CLI's MCP-only paradigm.
+ * Implements HookAdapter for Codex CLI's JSON stdin/stdout paradigm.
  *
  * Codex CLI hook specifics:
- *   - NO hook support (PRs #2904, #9796 were closed without merge)
- *   - Only "hook": notify config for agent-turn-complete (very limited)
- *   - Config: ~/.codex/config.toml (TOML format, not JSON)
- *   - MCP: full support via [mcp_servers] in config.toml
- *   - All capabilities are false — MCP is the only integration path
+ *   - 5 hook events: PreToolUse, PostToolUse, SessionStart, UserPromptSubmit, Stop
+ *   - Same wire protocol as Claude Code (JSON stdin → stdout)
+ *   - Config: ~/.codex/hooks.json + ~/.codex/config.toml (TOML for MCP/features)
  *   - Session dir: ~/.codex/context-mode/sessions/
+ *
+ * IMPORTANT: Hook dispatch is NOT yet active in Codex CLI (v0.118.0).
+ * codex_hooks feature flag is Stage::UnderDevelopment — hooks are implemented
+ * in codex-rs/hooks/ but not wired into the tool execution pipeline.
+ * Our adapter is ready; it will work once Codex enables dispatch.
+ * Track: https://github.com/openai/codex/issues/16685
  */
 
 import { createHash } from "node:crypto";
 import {
   readFileSync,
-  writeFileSync,
   mkdirSync,
   copyFileSync,
   accessSync,
@@ -39,8 +42,26 @@ import type {
   PreCompactResponse,
   SessionStartResponse,
   HookRegistration,
-  RoutingInstructionsConfig,
 } from "../types.js";
+
+// ─────────────────────────────────────────────────────────
+// Codex CLI raw input types
+// ─────────────────────────────────────────────────────────
+
+interface CodexHookInput {
+  tool_name?: string;
+  tool_input?: Record<string, unknown>;
+  tool_response?: string;
+  session_id?: string;
+  cwd?: string;
+  hook_event_name?: string;
+  model?: string;
+  permission_mode?: string;
+  tool_use_id?: string;
+  transcript_path?: string | null;
+  turn_id?: string;
+  source?: string;
+}
 
 // ─────────────────────────────────────────────────────────
 // Adapter implementation
@@ -48,55 +69,136 @@ import type {
 
 export class CodexAdapter implements HookAdapter {
   readonly name = "Codex CLI";
-  readonly paradigm: HookParadigm = "mcp-only";
+  readonly paradigm: HookParadigm = "json-stdio";
 
   readonly capabilities: PlatformCapabilities = {
-    preToolUse: false,
-    postToolUse: false,
+    preToolUse: true,
+    postToolUse: true,
     preCompact: false,
-    sessionStart: false,
+    sessionStart: true,
     canModifyArgs: false,
     canModifyOutput: false,
-    canInjectSessionContext: false,
+    canInjectSessionContext: true,
   };
 
   // ── Input parsing ──────────────────────────────────────
-  // Codex CLI does not support hooks. These methods exist to satisfy the
-  // interface contract but will throw if called.
 
-  parsePreToolUseInput(_raw: unknown): PreToolUseEvent {
-    throw new Error("Codex CLI does not support hooks");
+  parsePreToolUseInput(raw: unknown): PreToolUseEvent {
+    const input = raw as CodexHookInput;
+    return {
+      toolName: input.tool_name ?? "",
+      toolInput: input.tool_input ?? {},
+      sessionId: this.extractSessionId(input),
+      projectDir: input.cwd,
+      raw,
+    };
   }
 
-  parsePostToolUseInput(_raw: unknown): PostToolUseEvent {
-    throw new Error("Codex CLI does not support hooks");
+  parsePostToolUseInput(raw: unknown): PostToolUseEvent {
+    const input = raw as CodexHookInput;
+    return {
+      toolName: input.tool_name ?? "",
+      toolInput: input.tool_input ?? {},
+      toolOutput: input.tool_response,
+      sessionId: this.extractSessionId(input),
+      projectDir: input.cwd,
+      raw,
+    };
   }
 
-  parsePreCompactInput(_raw: unknown): PreCompactEvent {
-    throw new Error("Codex CLI does not support hooks");
+  parsePreCompactInput(raw: unknown): PreCompactEvent {
+    const input = raw as CodexHookInput;
+    return {
+      sessionId: this.extractSessionId(input),
+      projectDir: input.cwd,
+      raw,
+    };
   }
 
-  parseSessionStartInput(_raw: unknown): SessionStartEvent {
-    throw new Error("Codex CLI does not support hooks");
+  parseSessionStartInput(raw: unknown): SessionStartEvent {
+    const input = raw as CodexHookInput;
+    const rawSource = input.source ?? "startup";
+
+    let source: SessionStartEvent["source"];
+    switch (rawSource) {
+      case "compact":
+        source = "compact";
+        break;
+      case "resume":
+        source = "resume";
+        break;
+      case "clear":
+        source = "clear";
+        break;
+      default:
+        source = "startup";
+    }
+
+    return {
+      sessionId: this.extractSessionId(input),
+      source,
+      projectDir: input.cwd,
+      raw,
+    };
   }
 
   // ── Response formatting ────────────────────────────────
-  // Codex CLI does not support hooks. Return undefined for all responses.
+  // Codex CLI uses hookSpecificOutput wrapper for all hook responses.
+  // Unlike Claude Code, Codex does NOT support updatedInput or updatedMCPToolOutput.
 
-  formatPreToolUseResponse(_response: PreToolUseResponse): unknown {
-    return undefined;
+  formatPreToolUseResponse(response: PreToolUseResponse): unknown {
+    if (response.decision === "deny") {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason:
+            response.reason ?? "Blocked by context-mode hook",
+        },
+      };
+    }
+    if (response.decision === "context" && response.additionalContext) {
+      // Codex does not support additionalContext in PreToolUse (fails open).
+      // Context injection works via PostToolUse and SessionStart instead.
+      return {};
+    }
+    // "allow" — return empty object for passthrough
+    return {};
   }
 
-  formatPostToolUseResponse(_response: PostToolUseResponse): unknown {
-    return undefined;
+  formatPostToolUseResponse(response: PostToolUseResponse): unknown {
+    if (response.additionalContext) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PostToolUse",
+          additionalContext: response.additionalContext,
+        },
+      };
+    }
+    return {};
   }
 
-  formatPreCompactResponse(_response: PreCompactResponse): unknown {
-    return undefined;
+  formatPreCompactResponse(response: PreCompactResponse): unknown {
+    if (response.context) {
+      return {
+        hookSpecificOutput: {
+          additionalContext: response.context,
+        },
+      };
+    }
+    return {};
   }
 
-  formatSessionStartResponse(_response: SessionStartResponse): unknown {
-    return undefined;
+  formatSessionStartResponse(response: SessionStartResponse): unknown {
+    if (response.context) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "SessionStart",
+          additionalContext: response.context,
+        },
+      };
+    }
+    return {};
   }
 
   // ── Configuration ──────────────────────────────────────
@@ -127,9 +229,42 @@ export class CodexAdapter implements HookAdapter {
     return join(this.getSessionDir(), `${hash}-events.md`);
   }
 
-  generateHookConfig(_pluginRoot: string): HookRegistration {
-    // Codex CLI does not support hooks — return empty registration
-    return {};
+  generateHookConfig(pluginRoot: string): HookRegistration {
+    return {
+      PreToolUse: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: `node ${pluginRoot}/hooks/pretooluse.mjs`,
+            },
+          ],
+        },
+      ],
+      PostToolUse: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: `node ${pluginRoot}/hooks/posttooluse.mjs`,
+            },
+          ],
+        },
+      ],
+      SessionStart: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: `node ${pluginRoot}/hooks/sessionstart.mjs`,
+            },
+          ],
+        },
+      ],
+    };
   }
 
   readSettings(): Record<string, unknown> | null {
@@ -159,8 +294,7 @@ export class CodexAdapter implements HookAdapter {
         check: "Hook support",
         status: "warn",
         message:
-          "Codex CLI does not support hooks (PRs #2904, #9796 closed without merge). " +
-          "Only MCP integration is available.",
+          "Codex CLI hooks are implemented but dispatch is not yet active (Stage::UnderDevelopment, v0.118.0). Enable flag: [features] codex_hooks = true in ~/.codex/config.toml. Track: openai/codex#16685",
       },
     ];
   }
@@ -214,7 +348,7 @@ export class CodexAdapter implements HookAdapter {
   // ── Upgrade ────────────────────────────────────────────
 
   configureAllHooks(_pluginRoot: string): string[] {
-    // Codex CLI does not support hooks — nothing to configure
+    // Codex CLI hook configuration is done via hooks.json, not config.toml
     return [];
   }
 
@@ -231,44 +365,12 @@ export class CodexAdapter implements HookAdapter {
   }
 
   setHookPermissions(_pluginRoot: string): string[] {
-    // No hook scripts for Codex CLI
+    // Hook permissions are set during plugin install
     return [];
   }
 
   updatePluginRegistry(_pluginRoot: string, _version: string): void {
     // Codex CLI has no plugin registry
-  }
-
-  // ── Routing Instructions (soft enforcement) ────────────
-
-  getRoutingInstructionsConfig(): RoutingInstructionsConfig {
-    return {
-      fileName: "AGENTS.md",
-      globalPath: resolve(homedir(), ".codex", "AGENTS.md"),
-      projectRelativePath: "AGENTS.md",
-    };
-  }
-
-  writeRoutingInstructions(projectDir: string, pluginRoot: string): string | null {
-    const config = this.getRoutingInstructionsConfig();
-    const targetPath = resolve(projectDir, config.projectRelativePath);
-    const sourcePath = resolve(pluginRoot, "configs", "codex", config.fileName);
-
-    try {
-      const content = readFileSync(sourcePath, "utf-8");
-
-      try {
-        const existing = readFileSync(targetPath, "utf-8");
-        if (existing.includes("context-mode")) return null;
-        writeFileSync(targetPath, existing.trimEnd() + "\n\n" + content, "utf-8");
-        return targetPath;
-      } catch {
-        writeFileSync(targetPath, content, "utf-8");
-        return targetPath;
-      }
-    } catch {
-      return null;
-    }
   }
 
   getRoutingInstructions(): string {
@@ -287,5 +389,16 @@ export class CodexAdapter implements HookAdapter {
       // Fallback inline instructions
       return "# context-mode\n\nUse context-mode MCP tools (execute, execute_file, batch_execute, fetch_and_index, search) instead of bash/cat/curl for data-heavy operations.";
     }
+  }
+
+  // ── Internal helpers ───────────────────────────────────
+
+  /**
+   * Extract session ID from Codex CLI hook input.
+   * Priority: session_id field > fallback to ppid.
+   */
+  private extractSessionId(input: CodexHookInput): string {
+    if (input.session_id) return input.session_id;
+    return `pid-${process.ppid}`;
   }
 }

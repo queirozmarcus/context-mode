@@ -13,20 +13,10 @@ Run diagnostics and display results directly in the conversation.
 
 ## Instructions
 
-1. Derive the **plugin root** from this skill's base directory (go up 2 levels — remove `/skills/ctx-doctor`).
-2. Run with Bash:
+1. Call the `ctx_doctor` MCP tool directly. It runs all checks server-side and returns a markdown checklist.
+2. Display the results verbatim — they are already formatted as a checklist with `[x]` PASS, `[ ]` FAIL, `[-]` WARN.
+3. **Fallback** (only if MCP tool call fails): Derive the **plugin root** from this skill's base directory (go up 2 levels — remove `/skills/ctx-doctor`), then run with Bash:
    ```
    CLI="<PLUGIN_ROOT>/cli.bundle.mjs"; [ ! -f "$CLI" ] && CLI="<PLUGIN_ROOT>/build/cli.js"; node "$CLI" doctor
    ```
-3. **IMPORTANT**: After the Bash tool completes, re-display the key results as markdown text directly in the conversation so the user sees them without expanding the tool output. Format as a checklist:
-   ```
-   ## context-mode doctor
-   - [x] Runtimes: 6/10 (javascript, typescript, python, shell, ruby, perl)
-   - [x] Performance: FAST (Bun)
-   - [x] Server test: PASS
-   - [x] Hooks: PASS
-   - [x] FTS5: PASS
-   - [x] npm: v0.7.1
-   - [x] Marketplace: v0.7.1
-   ```
-   Use `[x]` for PASS, `[ ]` for FAIL, `[-]` for WARN.
+   Re-display results as a markdown checklist.

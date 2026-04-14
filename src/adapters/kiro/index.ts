@@ -5,8 +5,8 @@
  *
  * Kiro specifics:
  *   - Hooks via agent config files (~/.kiro/agents/<name>.json)
- *   - Config: ~/.kiro/settings/mcp_config.json (JSON format)
- *   - MCP: full support via mcpServers in mcp_config.json
+ *   - Config: ~/.kiro/settings/mcp.json (JSON format)
+ *   - MCP: full support via mcpServers in mcp.json
  *   - Hook exit codes: 0=allow, 2=block
  *   - Cannot modify tool input (exit codes only)
  *   - Session dir: ~/.kiro/context-mode/sessions/
@@ -51,7 +51,6 @@ import type {
   PreCompactResponse,
   SessionStartResponse,
   HookRegistration,
-  RoutingInstructionsConfig,
 } from "../types.js";
 
 // ─────────────────────────────────────────────────────────
@@ -150,7 +149,7 @@ export class KiroAdapter implements HookAdapter {
   // ── Configuration ──────────────────────────────────────
 
   getSettingsPath(): string {
-    return resolve(homedir(), ".kiro", "settings", "mcp_config.json");
+    return resolve(homedir(), ".kiro", "settings", "mcp.json");
   }
 
   getSessionDir(): string {
@@ -275,13 +274,13 @@ export class KiroAdapter implements HookAdapter {
         check: "MCP registration",
         status: "fail",
         message: "context-mode not found in mcpServers",
-        fix: "Add context-mode to mcpServers in ~/.kiro/settings/mcp_config.json",
+        fix: "Add context-mode to mcpServers in ~/.kiro/settings/mcp.json",
       };
     } catch {
       return {
         check: "MCP registration",
         status: "warn",
-        message: "Could not read ~/.kiro/settings/mcp_config.json",
+        message: "Could not read ~/.kiro/settings/mcp.json",
       };
     }
   }
@@ -369,39 +368,7 @@ export class KiroAdapter implements HookAdapter {
   }
 
   updatePluginRegistry(_pluginRoot: string, _version: string): void {
-    // Kiro plugin registry is managed via mcp_config.json
-  }
-
-  // ── Routing Instructions (soft enforcement) ────────────
-
-  getRoutingInstructionsConfig(): RoutingInstructionsConfig {
-    return {
-      fileName: "KIRO.md",
-      globalPath: resolve(homedir(), ".kiro", "KIRO.md"),
-      projectRelativePath: "KIRO.md",
-    };
-  }
-
-  writeRoutingInstructions(projectDir: string, pluginRoot: string): string | null {
-    const config = this.getRoutingInstructionsConfig();
-    const targetPath = resolve(projectDir, config.projectRelativePath);
-    const sourcePath = resolve(pluginRoot, "configs", "kiro", config.fileName);
-
-    try {
-      const content = readFileSync(sourcePath, "utf-8");
-
-      try {
-        const existing = readFileSync(targetPath, "utf-8");
-        if (existing.includes("context-mode")) return null;
-        writeFileSync(targetPath, existing.trimEnd() + "\n\n" + content, "utf-8");
-        return targetPath;
-      } catch {
-        writeFileSync(targetPath, content, "utf-8");
-        return targetPath;
-      }
-    } catch {
-      return null;
-    }
+    // Kiro plugin registry is managed via mcp.json
   }
 
   getRoutingInstructions(): string {

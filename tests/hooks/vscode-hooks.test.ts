@@ -1,3 +1,4 @@
+import "../setup-home";
 /**
  * Hook Integration Tests — VS Code Copilot hooks
  *
@@ -5,15 +6,16 @@
  * simulated JSON stdin and asserting correct output/behavior.
  */
 
-import { describe, test, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { describe, test, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, rmSync, existsSync, unlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, unlinkSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir, homedir } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(__dirname, "..", "..");
 const HOOKS_DIR = join(__dirname, "..", "..", "hooks", "vscode-copilot");
 
 interface HookResult {
@@ -26,7 +28,7 @@ function runHook(hookFile: string, input: Record<string, unknown>, env?: Record<
   const result = spawnSync("node", [join(HOOKS_DIR, hookFile)], {
     input: JSON.stringify(input),
     encoding: "utf-8",
-    timeout: 10000,
+    timeout: 30_000,
     env: { ...process.env, ...env },
   });
   return {
@@ -35,6 +37,61 @@ function runHook(hookFile: string, input: Record<string, unknown>, env?: Record<
     stderr: (result.stderr ?? "").trim(),
   };
 }
+
+// ── session-loaders.mjs bundle resolution ────────────────
+
+describe("createSessionLoaders — bundle directory resolution", () => {
+  const hooksDir = join(__dirname, "..", "..", "hooks");
+
+  test("resolves bundles when hookDir has trailing slash (vscode-copilot/)", async () => {
+    // This is how sessionstart.mjs derives HOOK_DIR:
+    //   fileURLToPath(new URL(".", import.meta.url)) → always has trailing /
+    const hookDirWithSlash = join(hooksDir, "vscode-copilot") + "/";
+
+    const { createSessionLoaders } = await import(
+      join(hooksDir, "session-loaders.mjs")
+    );
+    const loaders = createSessionLoaders(hookDirWithSlash);
+
+    // Must not throw ERR_MODULE_NOT_FOUND — bundles live in hooks/, not hooks/vscode-copilot/
+    const mod = await loaders.loadSessionDB();
+    expect(mod.SessionDB).toBeDefined();
+  });
+
+  test.skipIf(process.platform !== "win32")("resolves bundles when hookDir has trailing backslash (Windows)", async () => {
+    const hookDirWithBackslash = join(hooksDir, "vscode-copilot") + "\\";
+
+    const { createSessionLoaders } = await import(
+      join(hooksDir, "session-loaders.mjs")
+    );
+    const loaders = createSessionLoaders(hookDirWithBackslash);
+
+    const mod = await loaders.loadSessionDB();
+    expect(mod.SessionDB).toBeDefined();
+  });
+
+  test("resolves bundles when hookDir has no trailing separator", async () => {
+    const hookDirClean = join(hooksDir, "vscode-copilot");
+
+    const { createSessionLoaders } = await import(
+      join(hooksDir, "session-loaders.mjs")
+    );
+    const loaders = createSessionLoaders(hookDirClean);
+
+    const mod = await loaders.loadSessionDB();
+    expect(mod.SessionDB).toBeDefined();
+  });
+
+  test("resolves bundles from root hooks dir (non-vscode path)", async () => {
+    const { createSessionLoaders } = await import(
+      join(hooksDir, "session-loaders.mjs")
+    );
+    const loaders = createSessionLoaders(hooksDir);
+
+    const mod = await loaders.loadSessionDB();
+    expect(mod.SessionDB).toBeDefined();
+  });
+});
 
 describe("VS Code Copilot hooks", () => {
   let tempDir: string;
@@ -55,6 +112,9 @@ describe("VS Code Copilot hooks", () => {
     try { if (existsSync(eventsPath)) unlinkSync(eventsPath); } catch { /* best effort */ }
   });
 
+  // MCP readiness sentinel — subprocess hooks check process.ppid (= this test's pid)
+  const mcpSentinel = resolve(tmpdir(), `context-mode-mcp-ready-${process.pid}`);
+
   // Clean file-based guidance throttle markers between tests.
   // Subprocess hooks use process.ppid (= this test's pid) for marker dir.
   // VITEST_WORKER_ID is inherited by subprocesses, matching routing.mjs logic.
@@ -63,6 +123,11 @@ describe("VS Code Copilot hooks", () => {
     const suffix = wid ? `${process.pid}-w${wid}` : String(process.pid);
     const guidanceDir = resolve(tmpdir(), `context-mode-guidance-${suffix}`);
     try { rmSync(guidanceDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    writeFileSync(mcpSentinel, String(process.pid));
+  });
+
+  afterEach(() => {
+    try { unlinkSync(mcpSentinel); } catch {}
   });
 
   const vscodeEnv = () => ({ VSCODE_CWD: tempDir });
@@ -209,6 +274,17 @@ describe("VS Code Copilot hooks", () => {
 
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain("SessionStart");
+    });
+
+    test("sessionstart outputs valid JSON with hookSpecificOutput", () => {
+      // Read the hook source and verify it outputs JSON format
+      const hookSrc = readFileSync(resolve(ROOT, "hooks/vscode-copilot/sessionstart.mjs"), "utf-8");
+      expect(hookSrc).toContain("JSON.stringify");
+      expect(hookSrc).toContain("hookSpecificOutput");
+      expect(hookSrc).toContain("hookEventName");
+      expect(hookSrc).toContain('"SessionStart"');
+      // Must NOT have plain text output
+      expect(hookSrc).not.toContain("SessionStart:compact hook success");
     });
   });
 

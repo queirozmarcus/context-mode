@@ -42,7 +42,6 @@ export const PRE_TOOL_USE_MATCHERS = [
   "Read",
   "Grep",
   "Agent",
-  "Task",
   "mcp__plugin_context-mode_context-mode__ctx_execute",
   "mcp__plugin_context-mode_context-mode__ctx_execute_file",
   "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
@@ -53,6 +52,40 @@ export const PRE_TOOL_USE_MATCHERS = [
  * Used by the upgrade command when writing a single consolidated entry.
  */
 export const PRE_TOOL_USE_MATCHER_PATTERN = PRE_TOOL_USE_MATCHERS.join("|");
+
+// ─────────────────────────────────────────────────────────
+// PostToolUse matchers (#229)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Tools that context-mode's PostToolUse hook should fire on.
+ * Only tools that extractEvents() actually handles — all others
+ * produce zero events and cause false "hook error" display.
+ */
+export const POST_TOOL_USE_MATCHERS = [
+  "Bash",
+  "Read",
+  "Write",
+  "Edit",
+  "NotebookEdit",
+  "Glob",
+  "Grep",
+  "TodoWrite",
+  "TaskCreate",
+  "TaskUpdate",
+  "EnterPlanMode",
+  "ExitPlanMode",
+  "Skill",
+  "Agent",
+  "AskUserQuestion",
+  "EnterWorktree",
+  "mcp__",
+] as const;
+
+/**
+ * Combined matcher pattern for PostToolUse in hooks.json / settings.json.
+ */
+export const POST_TOOL_USE_MATCHER_PATTERN = POST_TOOL_USE_MATCHERS.join("|");
 
 // ─────────────────────────────────────────────────────────
 // Hook script file names
@@ -113,4 +146,35 @@ export function buildHookCommand(hookType: HookType, pluginRoot?: string): strin
     return `node "${pluginRoot}/hooks/${scriptName}"`;
   }
   return `context-mode hook claude-code ${hookType.toLowerCase()}`;
+}
+
+/**
+ * Extract the hook script file path from a command string.
+ * Returns the path if the command uses the `node "/path/to/hook.mjs"` format,
+ * or null if it uses the CLI dispatcher format (which is path-independent).
+ *
+ * Handles both quoted and unquoted paths, and both forward/back slashes.
+ */
+export function extractHookScriptPath(command: string): string | null {
+  // Match: node "/path/to/hooks/scriptname.mjs" or node /path/to/hooks/scriptname.mjs
+  const match = command.match(/node\s+"?([^"]+\.mjs)"?/);
+  return match?.[1] ?? null;
+}
+
+/**
+ * Check if a hook entry is a context-mode hook (any hook type).
+ * Broader than `isContextModeHook` — matches any context-mode script name
+ * without requiring a specific hookType.
+ */
+export function isAnyContextModeHook(
+  entry: { hooks?: Array<{ command?: string }> },
+): boolean {
+  const scriptNames = Object.values(HOOK_SCRIPTS);
+  return (
+    entry.hooks?.some((h) =>
+      h.command != null &&
+      (scriptNames.some((s) => h.command!.includes(s)) ||
+        h.command.includes("context-mode hook")),
+    ) ?? false
+  );
 }

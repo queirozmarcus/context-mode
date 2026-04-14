@@ -71,6 +71,13 @@ export const CURSOR_OPTS = {
   sessionIdEnv: "CURSOR_SESSION_ID",
 };
 
+/** Codex CLI platform options. */
+export const CODEX_OPTS = {
+  configDir: ".codex",
+  projectDirEnv: undefined,   // Codex passes cwd in hook stdin, no env var
+  sessionIdEnv: undefined,    // Uses session_id from hook stdin or ppid fallback
+};
+
 /** Kiro CLI platform options. */
 export const KIRO_OPTS = {
   configDir: ".kiro",
@@ -86,7 +93,7 @@ export function readStdin() {
     let data = "";
     process.stdin.setEncoding("utf-8");
     process.stdin.on("data", (chunk) => { data += chunk; });
-    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("end", () => resolve(data.replace(/^\uFEFF/, "")));
     process.stdin.on("error", reject);
     process.stdin.resume();
   });
@@ -170,3 +177,4 @@ export function getCleanupFlagPath(opts = CLAUDE_OPTS) {
   mkdirSync(dir, { recursive: true });
   return join(dir, `${hash}${getWorktreeSuffix()}.cleanup`);
 }
+

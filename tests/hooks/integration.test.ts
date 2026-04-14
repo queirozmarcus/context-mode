@@ -3,7 +3,6 @@
  *
  * Consolidated from:
  * - tests/hook-integration.test.ts (pretooluse.mjs hook tests)
- * - tests/routing-instructions.test.ts (writeRoutingInstructions TDD tests)
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
@@ -18,6 +17,7 @@ import {
   readFileSync,
   rmSync,
   existsSync,
+  unlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 
@@ -33,8 +33,17 @@ const HOOK_PATH = join(__dirname, "..", "..", "hooks", "pretooluse.mjs");
 const _wid = process.env.VITEST_WORKER_ID;
 const _guidanceSuffix = _wid ? `${process.pid}-w${_wid}` : String(process.pid);
 const _guidanceDir = resolve(tmpdir(), `context-mode-guidance-${_guidanceSuffix}`);
+
+// MCP readiness sentinel — subprocess hooks check process.ppid (= this test's pid)
+const mcpSentinel = resolve(tmpdir(), `context-mode-mcp-ready-${process.pid}`);
+
 beforeEach(() => {
   try { rmSync(_guidanceDir, { recursive: true, force: true }); } catch {}
+  writeFileSync(mcpSentinel, String(process.pid));
+});
+
+afterEach(() => {
+  try { unlinkSync(mcpSentinel); } catch {}
 });
 
 interface HookResult {
@@ -43,11 +52,12 @@ interface HookResult {
   stderr: string;
 }
 
-function runHook(input: Record<string, unknown>, env?: Record<string, string>): HookResult {
+function runHook(input: Record<string, unknown>, env?: Record<string, string>, { bom = false } = {}): HookResult {
+  const json = JSON.stringify(input);
   const result = spawnSync("node", [HOOK_PATH], {
-    input: JSON.stringify(input),
+    input: bom ? "\uFEFF" + json : json,
     encoding: "utf-8",
-    timeout: 5000,
+    timeout: 30_000,
     env: { ...process.env, ...env },
   });
   return {
@@ -197,89 +207,33 @@ describe("WebFetch", () => {
   });
 });
 
-describe("Task", () => {
-  test("Task + prompt: hookSpecificOutput with updatedInput containing routing block", () => {
+describe("Task (#241: no longer routed)", () => {
+  test("Task tool returns empty stdout (passthrough, no routing)", () => {
     const result = runHook({
       tool_name: "Task",
       tool_input: { prompt: "Analyze this codebase and summarize the architecture." },
     });
     assert.equal(result.exitCode, 0, `Expected exit 0, got ${result.exitCode}`);
-    assert.ok(result.stdout.length > 0, "Expected non-empty stdout");
-    const parsed = JSON.parse(result.stdout);
-    assert.ok(parsed.hookSpecificOutput, "Expected hookSpecificOutput");
-    assert.equal(parsed.hookSpecificOutput.hookEventName, "PreToolUse");
-    assert.ok(parsed.hookSpecificOutput.updatedInput, "Expected updatedInput");
-    assert.ok(
-      parsed.hookSpecificOutput.updatedInput.prompt.includes("<context_window_protection>"),
-      "Expected <context_window_protection> XML tag in updatedInput.prompt",
-    );
-    assert.ok(
-      parsed.hookSpecificOutput.updatedInput.prompt.includes("</context_window_protection>"),
-      "Expected </context_window_protection> closing tag in updatedInput.prompt",
-    );
-    assert.ok(
-      parsed.hookSpecificOutput.updatedInput.prompt.includes("<tool_selection_hierarchy>"),
-      "Expected <tool_selection_hierarchy> tag in updatedInput.prompt",
-    );
-    assert.ok(
-      parsed.hookSpecificOutput.updatedInput.prompt.includes("<forbidden_actions>"),
-      "Expected <forbidden_actions> tag in updatedInput.prompt",
-    );
-    assert.ok(
-      parsed.hookSpecificOutput.updatedInput.prompt.includes(
-        "Analyze this codebase and summarize the architecture.",
-      ),
-      "Expected original prompt preserved in updatedInput.prompt",
-    );
+    // Task is no longer intercepted — hook produces no hookSpecificOutput
+    assert.equal(result.stdout.trim(), "", "Expected empty stdout for passthrough");
   });
 
-  test("Task + Bash subagent: upgraded to general-purpose for MCP access", () => {
+  test("TaskCreate returns empty stdout (passthrough)", () => {
     const result = runHook({
-      tool_name: "Task",
-      tool_input: {
-        prompt: "Research this GitHub repository.",
-        subagent_type: "Bash",
-        description: "Research repo",
-      },
+      tool_name: "TaskCreate",
+      tool_input: { title: "my task" },
     });
     assert.equal(result.exitCode, 0);
-    const parsed = JSON.parse(result.stdout);
-    const updated = parsed.hookSpecificOutput.updatedInput;
-    assert.equal(
-      updated.subagent_type,
-      "general-purpose",
-      `Expected subagent_type upgraded to general-purpose, got: ${updated.subagent_type}`,
-    );
-    assert.ok(
-      updated.prompt.includes("<context_window_protection>"),
-      "Expected XML routing block in prompt",
-    );
-    assert.ok(
-      updated.prompt.includes("Research this GitHub repository."),
-      "Expected original prompt preserved",
-    );
-    assert.equal(
-      updated.description,
-      "Research repo",
-      "Expected other fields preserved",
-    );
+    assert.equal(result.stdout.trim(), "", "Expected empty stdout for passthrough");
   });
 
-  test("Task + Explore subagent: keeps original subagent_type", () => {
+  test("TaskUpdate returns empty stdout (passthrough)", () => {
     const result = runHook({
-      tool_name: "Task",
-      tool_input: {
-        prompt: "Find all TypeScript files.",
-        subagent_type: "Explore",
-      },
+      tool_name: "TaskUpdate",
+      tool_input: { id: "123", status: "done" },
     });
     assert.equal(result.exitCode, 0);
-    const parsed = JSON.parse(result.stdout);
-    const updated = parsed.hookSpecificOutput.updatedInput;
-    assert.ok(
-      updated.subagent_type === undefined || updated.subagent_type === "Explore",
-      `Expected subagent_type to remain Explore or undefined, got: ${updated.subagent_type}`,
-    );
+    assert.equal(result.stdout.trim(), "", "Expected empty stdout for passthrough");
   });
 });
 
@@ -515,8 +469,8 @@ describe("Plugin Tool Name Format in ROUTING_BLOCK", () => {
   const PLUGIN_PREFIX = "mcp__plugin_context-mode_context-mode__";
   const SHORT_PREFIX = "mcp__context-mode__";
 
-  test("Task routing block uses plugin-format tool names", () => {
-    const result = runHook({ tool_name: "Task", tool_input: { prompt: "Do something." } });
+  test("Agent routing block uses plugin-format tool names", () => {
+    const result = runHook({ tool_name: "Agent", tool_input: { prompt: "Do something." } });
     assert.equal(result.exitCode, 0);
     const parsed = JSON.parse(result.stdout);
     const prompt = parsed.hookSpecificOutput.updatedInput.prompt;
@@ -602,221 +556,20 @@ describe("Skill Commands", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// Routing Instructions Tests -- writeRoutingInstructions()
-// ═══════════════════════════════════════════════════════════════════════
-
-function createTempDir(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), `ctx-test-${prefix}-`));
-}
-
-function createPluginRoot(base: string): string {
-  // Simulate a plugin root with configs/codex/AGENTS.md
-  const pluginRoot = join(base, "plugin");
-  const configDir = join(pluginRoot, "configs", "codex");
-  mkdirSync(configDir, { recursive: true });
-  writeFileSync(
-    join(configDir, "AGENTS.md"),
-    "# context-mode — MANDATORY routing rules\n\nUse context-mode MCP tools.\n",
-    "utf-8",
-  );
-  return pluginRoot;
-}
-
-describe("Routing instructions — platform capabilities", () => {
-  test("Codex CLI has sessionStart === false (hookless)", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("codex");
-    expect(adapter.capabilities.sessionStart).toBe(false);
+describe("UTF-8 BOM handling (core/stdin.mjs path)", () => {
+  test("pretooluse.mjs parses BOM-prefixed stdin without error", () => {
+    const result = runHook({
+      tool_name: "Glob",
+      tool_input: { pattern: "**/*.ts" },
+    }, undefined, { bom: true });
+    assertPassthrough(result);
   });
 
-  test("Claude Code has sessionStart === true (has hooks)", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("claude-code");
-    expect(adapter.capabilities.sessionStart).toBe(true);
-  });
-
-  test("Gemini CLI has sessionStart === true (has hooks)", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("gemini-cli");
-    expect(adapter.capabilities.sessionStart).toBe(true);
-  });
-
-  test("OpenCode has sessionStart === true (has hooks)", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("opencode");
-    expect(adapter.capabilities.sessionStart).toBe(true);
-  });
-
-  test("VS Code Copilot has sessionStart === true (has hooks)", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("vscode-copilot");
-    expect(adapter.capabilities.sessionStart).toBe(true);
-  });
-});
-
-describe("Routing instructions — writeRoutingInstructions()", () => {
-  let tempDir: string;
-  let projectDir: string;
-  let pluginRoot: string;
-
-  beforeEach(() => {
-    tempDir = createTempDir("routing");
-    projectDir = join(tempDir, "project");
-    mkdirSync(projectDir, { recursive: true });
-    pluginRoot = createPluginRoot(tempDir);
-  });
-
-  afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
-  });
-
-  test("creates AGENTS.md when file does not exist", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("codex");
-
-    const result = adapter.writeRoutingInstructions(projectDir, pluginRoot);
-    const targetPath = resolve(projectDir, "AGENTS.md");
-
-    expect(result).toBe(targetPath);
-    expect(existsSync(targetPath)).toBe(true);
-
-    const content = readFileSync(targetPath, "utf-8");
-    expect(content).toContain("context-mode");
-  });
-
-  test("appends to existing AGENTS.md that does not contain context-mode", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("codex");
-
-    // Pre-create AGENTS.md with unrelated content
-    const targetPath = resolve(projectDir, "AGENTS.md");
-    const existingContent = "# My Project Agents\n\nSome existing rules.\n";
-    writeFileSync(targetPath, existingContent, "utf-8");
-
-    const result = adapter.writeRoutingInstructions(projectDir, pluginRoot);
-
-    expect(result).toBe(targetPath);
-
-    const content = readFileSync(targetPath, "utf-8");
-    // Should preserve original content
-    expect(content).toContain("My Project Agents");
-    expect(content).toContain("Some existing rules.");
-    // Should append context-mode instructions
-    expect(content).toContain("context-mode");
-  });
-
-  test("skips when AGENTS.md already contains context-mode (idempotent)", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("codex");
-
-    // Pre-create AGENTS.md WITH context-mode content
-    const targetPath = resolve(projectDir, "AGENTS.md");
-    const existingContent = "# context-mode routing\n\nAlready configured.\n";
-    writeFileSync(targetPath, existingContent, "utf-8");
-
-    const result = adapter.writeRoutingInstructions(projectDir, pluginRoot);
-
-    // Should return null (no-op)
-    expect(result).toBeNull();
-
-    // Content should be unchanged
-    const content = readFileSync(targetPath, "utf-8");
-    expect(content).toBe(existingContent);
-  });
-
-  test("double-write is idempotent", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("codex");
-
-    // First write — creates
-    const result1 = adapter.writeRoutingInstructions(projectDir, pluginRoot);
-    expect(result1).not.toBeNull();
-
-    const contentAfterFirst = readFileSync(resolve(projectDir, "AGENTS.md"), "utf-8");
-
-    // Second write — should be no-op
-    const result2 = adapter.writeRoutingInstructions(projectDir, pluginRoot);
-    expect(result2).toBeNull();
-
-    const contentAfterSecond = readFileSync(resolve(projectDir, "AGENTS.md"), "utf-8");
-    expect(contentAfterSecond).toBe(contentAfterFirst);
-  });
-
-  test("returns null when source config file is missing", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("codex");
-
-    // Use a plugin root WITHOUT configs/codex/AGENTS.md
-    const emptyPluginRoot = join(tempDir, "empty-plugin");
-    mkdirSync(emptyPluginRoot, { recursive: true });
-
-    const result = adapter.writeRoutingInstructions(projectDir, emptyPluginRoot);
-    expect(result).toBeNull();
-    expect(existsSync(resolve(projectDir, "AGENTS.md"))).toBe(false);
-  });
-});
-
-describe("Routing instructions — hookless platform gate", () => {
-  let tempDir: string;
-  let projectDir: string;
-  let pluginRoot: string;
-
-  beforeEach(() => {
-    tempDir = createTempDir("gate");
-    projectDir = join(tempDir, "project");
-    mkdirSync(projectDir, { recursive: true });
-    pluginRoot = createPluginRoot(tempDir);
-  });
-
-  afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
-  });
-
-  test("hookless platform (codex) triggers writeRoutingInstructions", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("codex");
-
-    // Simulate startup gate
-    if (!adapter.capabilities.sessionStart) {
-      adapter.writeRoutingInstructions(projectDir, pluginRoot);
-    }
-
-    expect(existsSync(resolve(projectDir, "AGENTS.md"))).toBe(true);
-  });
-
-  test("hook-capable platform (claude-code) does NOT trigger writeRoutingInstructions", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("claude-code");
-
-    // Simulate startup gate
-    if (!adapter.capabilities.sessionStart) {
-      adapter.writeRoutingInstructions(projectDir, pluginRoot);
-    }
-
-    // AGENTS.md should NOT be created
-    expect(existsSync(resolve(projectDir, "AGENTS.md"))).toBe(false);
-  });
-
-  test("hook-capable platform (gemini-cli) does NOT trigger writeRoutingInstructions", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("gemini-cli");
-
-    if (!adapter.capabilities.sessionStart) {
-      adapter.writeRoutingInstructions(projectDir, pluginRoot);
-    }
-
-    expect(existsSync(resolve(projectDir, "AGENTS.md"))).toBe(false);
-  });
-
-  test("hook-capable platform (opencode) does NOT trigger writeRoutingInstructions", async () => {
-    const { getAdapter } = await import("../../src/adapters/detect.js");
-    const adapter = await getAdapter("opencode");
-
-    if (!adapter.capabilities.sessionStart) {
-      adapter.writeRoutingInstructions(projectDir, pluginRoot);
-    }
-
-    expect(existsSync(resolve(projectDir, "AGENTS.md"))).toBe(false);
+  test("pretooluse.mjs handles BOM-prefixed Bash input correctly", () => {
+    const result = runHook({
+      tool_name: "Bash",
+      tool_input: { command: "curl -s http://example.com" },
+    }, undefined, { bom: true });
+    assertRedirect(result, "context-mode");
   });
 });

@@ -4,7 +4,7 @@ This project is licensed under the Elastic License 2.0 (ELv2) and moves forward 
 
 Don't overthink it. Don't ask yourself "is my PR good enough?" or "is this issue too small?" -- just send it. A rough draft beats a perfect plan that never ships. If you found a bug, report it. If you have an idea, open an issue. If you wrote a fix, submit the PR.
 
-That said, I'm a solo maintainer with limited time. The best way to help me help you: follow the templates, include your `/context-mode:doctor` output, and write tests for your changes. The more context you give me, the faster I can review.
+That said, I'm a solo maintainer with limited time. The best way to help me help you: follow the templates, run the debug script (`bash scripts/ctx-debug.sh`), and write tests for your changes. The more context you give me, the faster I can review.
 
 I genuinely love open source and I'm grateful to have you here. Don't hesitate to reach out -- whether it's a question, a suggestion, or just to say hi. Let's build this together.
 
@@ -133,7 +133,7 @@ The symlink in step 2 ensures `hooks.json` (which registers PostToolUse, PreComp
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Read|Grep|WebFetch|Agent|Task|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+        "matcher": "Bash|Read|Grep|WebFetch|Agent|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute",
         "hooks": [
           {
             "type": "command",
@@ -257,7 +257,11 @@ After rebuilding, restart your Claude Code session. The MCP server reloads on se
 
 We follow test-driven development. Every PR must include tests.
 
-**We strongly recommend installing the [TDD skill](https://github.com/anthropics/claude-code-skills) for Claude Code** -- it enforces the red-green-refactor loop automatically.
+**We strongly recommend installing the context-mode-ops skill** — it includes TDD enforcement, issue triage, PR review, and release automation with parallel subagent orchestration:
+
+```bash
+npx skills add mksglu/context-mode --skill context-mode-ops
+```
 
 ### Red-Green-Refactor
 
@@ -280,6 +284,10 @@ We follow test-driven development. Every PR must include tests.
 | Hook routing | `tests/hooks/core-routing.test.ts` |
 | Hook formatting | `tests/hooks/formatters.test.ts` |
 | Hook integration | `tests/hooks/integration.test.ts` |
+| Cursor hooks | `tests/hooks/cursor-hooks.test.ts` |
+| Gemini hooks | `tests/hooks/gemini-hooks.test.ts` |
+| VS Code hooks | `tests/hooks/vscode-hooks.test.ts` |
+| Kiro hooks | `tests/hooks/kiro-hooks.test.ts` |
 | Session DB | `tests/session/session-db.test.ts` |
 | Session extract | `tests/session/session-extract.test.ts` |
 | Session snapshot | `tests/session/session-snapshot.test.ts` |
@@ -318,31 +326,25 @@ To test against a running OpenClaw gateway:
 
 1. Install the plugin:
    ```bash
-   scripts/install-openclaw-plugin.sh [OPENCLAW_STATE_DIR]
+   npm run install:openclaw
+   # Or with a custom state directory:
+   npm run install:openclaw -- /path/to/openclaw-state
    ```
+   The script picks up `$OPENCLAW_STATE_DIR` from your environment (default: `/openclaw`). It handles building, native dependency rebuild, extension registration, and gateway restart in one step.
 
-2. Rebuild native dependencies for the system Node version:
-   ```bash
-   npm rebuild better-sqlite3
-   ```
-
-3. Restart the gateway (SIGUSR1 triggers config reload):
-   ```bash
-   kill -USR1 $(pgrep -f "node.*openclaw/dist/index.js")
-   ```
-
-4. Open a Pi Agent session and verify hooks fire by checking the debug log output.
+2. Open a Pi Agent session and verify hooks fire by checking the debug log output.
 
 See [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md) for hook registration details and known upstream issues.
 
 ## Submitting a Bug Report
 
-When filing a bug, **always include your prompt**. The exact message you sent to Claude Code is critical for reproduction. Without it, we can't debug the issue.
+When filing a bug, **always include your prompt**. The exact message you sent to the agent is critical for reproduction. Without it, we can't debug the issue.
 
 Required information:
-- `/context-mode:doctor` output (must be latest version)
+- Debug script output: `bash scripts/ctx-debug.sh` (collects OS, runtimes, configs, hooks, SQLite diagnostics)
 - The prompt that triggered the bug
-- Debug logs from `Ctrl+O` (background tool calls and MCP communication)
+- Full error output (expand with `Ctrl+O` in Claude Code)
+- Steps to reproduce
 
 ## Submitting a Pull Request
 
@@ -359,9 +361,11 @@ Required information:
 
 | Task | Command |
 |---|---|
-| Check version | `/context-mode:doctor` |
-| Upgrade plugin | `/context-mode:upgrade` |
-| View session stats | `/context-mode:stats` |
+| Check version | `/context-mode:ctx-doctor` |
+| Upgrade plugin | `/context-mode:ctx-upgrade` |
+| View session stats | `/context-mode:ctx-stats` |
+| Purge knowledge base | `/context-mode:ctx-purge` |
+| Run diagnostics | `bash scripts/ctx-debug.sh` |
 | See background steps | `Ctrl+O` |
 | Kill cached server | `pkill -f "context-mode.*start.mjs"` |
 | Rebuild after changes | `npm run build` |

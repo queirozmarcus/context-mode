@@ -13,20 +13,19 @@ Pull latest from GitHub and reinstall the plugin.
 
 ## Instructions
 
-1. Derive the **plugin root** from this skill's base directory (go up 2 levels — remove `/skills/ctx-upgrade`).
-2. Run with Bash:
-   ```
-   CLI="<PLUGIN_ROOT>/cli.bundle.mjs"; [ ! -f "$CLI" ] && CLI="<PLUGIN_ROOT>/build/cli.js"; node "$CLI" upgrade
-   ```
-3. **IMPORTANT**: After the Bash tool completes, re-display the key results as markdown text directly in the conversation so the user sees them without expanding the tool output. Format as:
+1. Call the `ctx_upgrade` MCP tool directly. It returns a shell command to execute.
+2. Run the returned command using your shell execution tool (Bash, shell_execute, etc.).
+3. Display results as a markdown checklist:
    ```
    ## context-mode upgrade
    - [x] Pulled latest from GitHub
-   - [x] Built and installed v0.9.13
-   - [x] npm global updated
+   - [x] Built and installed v1.0.39
    - [x] Hooks configured
-   - [x] Permissions set
    - [x] Doctor: all checks PASS
    ```
-   Use `[x]` for success, `[ ]` for failure. Show the actual version numbers and any warnings.
-   Tell the user to **restart their Claude Code session** to pick up the new version.
+   Use `[x]` for success, `[ ]` for failure. Show actual version numbers.
+4. Tell the user to **restart their session** to pick up the new version.
+5. **Fallback** (only if MCP tool call fails): Derive the **plugin root** from this skill's base directory (go up 2 levels — remove `/skills/ctx-upgrade`), then run with Bash:
+   ```
+   CLI="<PLUGIN_ROOT>/cli.bundle.mjs"; [ ! -f "$CLI" ] && CLI="<PLUGIN_ROOT>/build/cli.js"; node "$CLI" upgrade
+   ```

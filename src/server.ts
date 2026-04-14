@@ -3,13 +3,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { existsSync, unlinkSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, rmSync, mkdirSync, cpSync, statSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
+import { request as httpsRequest } from "node:https";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
-import { ContentStore, cleanupStaleDBs, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
 import {
   readBashPolicies,
   evaluateCommandDenyOnly,
@@ -26,6 +28,9 @@ import {
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
 import { getWorktreeSuffix } from "./session/db.js";
+import type { HookAdapter } from "./adapters/types.js";
+import { loadDatabase } from "./db-base.js";
+import { AnalyticsEngine, formatReport } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -52,10 +57,31 @@ const server = new McpServer({
   version: VERSION,
 });
 
+// Register empty prompts/resources handlers so MCP clients don't get -32601 (#168).
+// OpenCode calls listPrompts()/listResources() unconditionally — the error can poison
+// the SDK transport layer, causing subsequent listTools() calls to fail permanently.
+import { ListPromptsRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+server.server.registerCapabilities({ prompts: { listChanged: false }, resources: { listChanged: false } });
+server.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [] }));
+server.server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
+server.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({ resourceTemplates: [] }));
+
 const executor = new PolyglotExecutor({
   runtimes,
   projectRoot: process.env.CLAUDE_PROJECT_DIR,
 });
+
+// ─────────────────────────────────────────────────────────
+// FS read tracking preload for batch_execute
+// ─────────────────────────────────────────────────────────
+// NODE_OPTIONS is denied by the executor's #buildSafeEnv (security).
+// Instead, we inject it as an inline shell env prefix in each batch command.
+// This temp file is loaded via --require when batch commands spawn Node processes.
+const CM_FS_PRELOAD = join(tmpdir(), `cm-fs-preload-${process.pid}.js`);
+writeFileSync(
+  CM_FS_PRELOAD,
+  `(function(){var __cm_fs=0;process.on('exit',function(){if(__cm_fs>0)try{process.stderr.write('__CM_FS__:'+__cm_fs+'\\n')}catch(e){}});try{var f=require('fs');var ors=f.readFileSync;f.readFileSync=function(){var r=ors.apply(this,arguments);if(Buffer.isBuffer(r))__cm_fs+=r.length;else if(typeof r==='string')__cm_fs+=Buffer.byteLength(r);return r;};}catch(e){}})();\n`,
+);
 
 // Lazy singleton — no DB overhead unless index/search is used
 let _store: ContentStore | null = null;
@@ -70,7 +96,7 @@ let _store: ContentStore | null = null;
  */
 function maybeIndexSessionEvents(store: ContentStore): void {
   try {
-    const sessionsDir = join(homedir(), ".claude", "context-mode", "sessions");
+    const sessionsDir = getSessionDir();
     if (!existsSync(sessionsDir)) return;
     const files = readdirSync(sessionsDir).filter(f => f.endsWith("-events.md"));
     for (const file of files) {
@@ -83,8 +109,94 @@ function maybeIndexSessionEvents(store: ContentStore): void {
   } catch { /* best-effort — session continuity never blocks tools */ }
 }
 
+// ── Platform-aware paths ──────────────────────────────────────────────────
+// The adapter (stored after MCP handshake) is the canonical source for
+// platform-specific paths. All session DB paths go through it — no
+// hardcoded configDir detection in tool handlers.
+
+let _detectedAdapter: HookAdapter | null = null;
+
+/**
+ * Get the platform-specific sessions directory from the detected adapter.
+ * Falls back to ~/.claude/context-mode/sessions/ before adapter detection.
+ */
+function getSessionDir(): string {
+  if (_detectedAdapter) return _detectedAdapter.getSessionDir();
+  const dir = join(homedir(), ".claude", "context-mode", "sessions");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/**
+ * Project directory detection across supported platforms.
+ *
+ * Priority:
+ *   1. Platform-specific env var (set by host IDE before MCP server spawn)
+ *   2. CONTEXT_MODE_PROJECT_DIR (set by start.mjs for ALL platforms — universal)
+ *   3. process.cwd() (last resort)
+ *
+ * CONTEXT_MODE_PROJECT_DIR guarantees correct projectDir even for platforms
+ * that don't set their own env var (Cursor, OpenClaw, Codex, Kiro, Zed).
+ */
+function getProjectDir(): string {
+  return process.env.CLAUDE_PROJECT_DIR
+    || process.env.GEMINI_PROJECT_DIR
+    || process.env.VSCODE_CWD
+    || process.env.OPENCODE_PROJECT_DIR
+    || process.env.PI_PROJECT_DIR
+    || process.env.CONTEXT_MODE_PROJECT_DIR
+    || process.cwd();
+}
+
+/**
+ * Consistent project dir hashing across all DB paths.
+ * Normalizes Windows backslashes before hashing so the same project
+ * always produces the same hash regardless of path separator.
+ */
+function hashProjectDir(): string {
+  const projectDir = getProjectDir();
+  const normalized = projectDir.replace(/\\/g, "/");
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+}
+
+/**
+ * Compute a per-project, per-platform persistent path for the ContentStore.
+ * Derives content dir from the adapter's session dir so each platform
+ * has its own isolated FTS5 DB — no cross-platform data sharing.
+ *
+ * Layout: ~/<configDir>/context-mode/content/<hash>.db
+ *   e.g.  ~/.claude/context-mode/content/87c28c41ddb64d38.db
+ *         ~/.cursor/context-mode/content/87c28c41ddb64d38.db
+ */
+function getStorePath(): string {
+  const hash = hashProjectDir();
+  // Derive content dir from session dir: .../sessions/ → .../content/
+  const sessDir = getSessionDir();
+  const dir = join(dirname(sessDir), "content");
+  mkdirSync(dir, { recursive: true });
+  return join(dir, `${hash}.db`);
+}
+
 function getStore(): ContentStore {
-  if (!_store) _store = new ContentStore();
+  if (!_store) {
+    // Content DB cleanup on fresh start is handled by SessionStart hook.
+    // Server just opens whatever DB exists (or creates new if hook deleted it).
+    const dbPath = getStorePath();
+    _store = new ContentStore(dbPath);
+
+    // One-time startup cleanup: remove stale content DBs (>14 days)
+    try {
+      const contentDir = dirname(getStorePath());
+      cleanupStaleContentDBs(contentDir, 14);
+      _store.cleanupStaleSources(14);
+      // Also clean legacy shared dir from before platform isolation
+      const legacyDir = join(homedir(), ".context-mode", "content");
+      if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
+    } catch { /* best-effort */ }
+
+    // Also clean old PID-based DBs from migration
+    cleanupStaleDBs();
+  }
   maybeIndexSessionEvents(_store);
   return _store;
 }
@@ -98,6 +210,8 @@ const sessionStats = {
   bytesReturned: {} as Record<string, number>,
   bytesIndexed: 0,
   bytesSandboxed: 0, // network I/O consumed inside sandbox (never enters context)
+  cacheHits: 0,
+  cacheBytesSaved: 0, // bytes avoided by TTL cache hits
   sessionStart: Date.now(),
 };
 
@@ -106,7 +220,73 @@ type ToolResult = {
   isError?: boolean;
 };
 
+// ── Version outdated warning ──────────────────────────────────────────────
+// Non-blocking npm check at startup. trackResponse prepends warning
+// using a burst cadence: 3 warnings → 1h silent → 3 warnings → repeat.
+
+let _latestVersion: string | null = null;
+let _warningBurstCount = 0;
+let _lastBurstStart = 0;
+const VERSION_BURST_SIZE = 3;
+const VERSION_SILENT_MS = 60 * 60 * 1000; // 1 hour
+
+async function fetchLatestVersion(): Promise<string> {
+  return new Promise((res) => {
+    const req = httpsRequest(
+      "https://registry.npmjs.org/context-mode/latest",
+      { headers: { Connection: "close" } },
+      (resp) => {
+        let raw = "";
+        resp.on("data", (chunk: Buffer) => { raw += chunk; });
+        resp.on("end", () => {
+          try {
+            const data = JSON.parse(raw) as { version?: string };
+            res(data.version ?? "unknown");
+          } catch { res("unknown"); }
+        });
+      },
+    );
+    req.on("error", () => res("unknown"));
+    req.setTimeout(5000, () => { req.destroy(); res("unknown"); });
+    req.end();
+  });
+}
+
+function getUpgradeHint(): string {
+  const name = _detectedAdapter?.name;
+  if (name === "Claude Code") return "/ctx-upgrade";
+  if (name === "OpenClaw") return "npm run install:openclaw";
+  if (name === "Pi") return "npm run build";
+  return "npm update -g context-mode";
+}
+
+function isOutdated(): boolean {
+  if (!_latestVersion || _latestVersion === "unknown") return false;
+  return _latestVersion !== VERSION;
+}
+
+function shouldShowVersionWarning(): boolean {
+  if (!isOutdated()) return false;
+  const now = Date.now();
+  // Start of a new burst?
+  if (_warningBurstCount >= VERSION_BURST_SIZE) {
+    if (now - _lastBurstStart < VERSION_SILENT_MS) return false; // still silent
+    _warningBurstCount = 0; // silence over, reset burst
+  }
+  if (_warningBurstCount === 0) _lastBurstStart = now;
+  _warningBurstCount++;
+  return true;
+}
+
 function trackResponse(toolName: string, response: ToolResult): ToolResult {
+  // Prepend version outdated warning if needed
+  if (shouldShowVersionWarning() && response.content.length > 0) {
+    const hint = getUpgradeHint();
+    response.content[0].text =
+      `⚠️ context-mode v${VERSION} outdated → v${_latestVersion} available. Upgrade: ${hint}\n\n` +
+      response.content[0].text;
+  }
+
   const bytes = response.content.reduce(
     (sum, c) => sum + Buffer.byteLength(c.text),
     0,
@@ -334,6 +514,44 @@ export function extractSnippet(
   return parts.join("\n\n");
 }
 
+export function formatBatchQueryResults(
+  store: ContentStore,
+  queries: string[],
+  source: string,
+  maxOutput = 80 * 1024,
+): string[] {
+  const sections: string[] = [];
+  let outputSize = 0;
+
+  for (const query of queries) {
+    if (outputSize > maxOutput) {
+      sections.push(`## ${query}\n(output cap reached — use search(queries: ["${query}"]) for details)\n`);
+      continue;
+    }
+
+    const results = store.searchWithFallback(query, 3, source, undefined, "exact");
+    sections.push(`## ${query}`);
+    sections.push("");
+    if (results.length > 0) {
+      for (const result of results) {
+        const snippet = extractSnippet(result.content, query, 3000, result.highlighted);
+        sections.push(`### ${result.title}`);
+        sections.push(snippet);
+        sections.push("");
+        outputSize += snippet.length + result.title.length;
+      }
+      continue;
+    }
+
+    sections.push("No matching sections found.");
+    sections.push("");
+  }
+
+  sections.push(`\n> **Tip:** Results are scoped to this batch only. To search across all indexed sources, use \`ctx_search(queries: [...])\`.`);
+
+  return sections;
+}
+
 // ─────────────────────────────────────────────────────────
 // Tool: execute
 // ─────────────────────────────────────────────────────────
@@ -342,7 +560,7 @@ server.registerTool(
   "ctx_execute",
   {
     title: "Execute Code",
-    description: `MANDATORY: Use for any command where output exceeds 20 lines. Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.`,
+    description: `MANDATORY: Use for any command where output exceeds 20 lines. Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.\n\nTHINK IN CODE: When you need to analyze, count, filter, compare, or process data — write code that does the work and console.log() only the answer. Do NOT read raw data into context to process mentally. Program the analysis, don't compute it in your reasoning. Write robust, pure JavaScript (no npm dependencies). Use only Node.js built-ins (fs, path, child_process). Always wrap in try/catch. Handle null/undefined. Works on both Node.js and Bun.`,
     inputSchema: z.object({
       language: z
         .enum([
@@ -404,6 +622,19 @@ server.registerTool(
         // The closure approach (function(__cm_req){ var require=...; })(require) correctly
         // shadows the CJS require for all code inside, including __cm_main().
         instrumentedCode = `
+// FS read instrumentation — count bytes read via fs.readFileSync/readFile
+let __cm_fs=0;
+process.on('exit',()=>{if(__cm_fs>0)try{process.stderr.write('__CM_FS__:'+__cm_fs+'\\n')}catch{}});
+(function(){
+  try{
+    var f=typeof require!=='undefined'?require('fs'):null;
+    if(!f)return;
+    var ors=f.readFileSync;
+    f.readFileSync=function(){var r=ors.apply(this,arguments);if(Buffer.isBuffer(r))__cm_fs+=r.length;else if(typeof r==='string')__cm_fs+=Buffer.byteLength(r);return r;};
+    var orf=f.readFile;
+    if(orf)f.readFile=function(){var a=Array.from(arguments),cb=a.pop();orf.apply(this,a.concat([function(e,d){if(!e&&d){if(Buffer.isBuffer(d))__cm_fs+=d.length;else if(typeof d==='string')__cm_fs+=Buffer.byteLength(d);}cb(e,d);}]));};
+  }catch{}
+})();
 let __cm_net=0;
 // Report network bytes on process exit — works with both promise and callback patterns.
 // process.on('exit') fires after all I/O completes, unlike .finally() which fires
@@ -460,6 +691,13 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         result.stderr = result.stderr.replace(/\n?__CM_NET__:\d+\n?/g, "");
       }
 
+      // Parse sandbox FS read metrics from stderr
+      const fsMatch = result.stderr?.match(/__CM_FS__:(\d+)/);
+      if (fsMatch) {
+        sessionStats.bytesSandboxed += parseInt(fsMatch[1]);
+        result.stderr = result.stderr.replace(/\n?__CM_FS__:\d+\n?/g, "");
+      }
+
       if (result.timedOut) {
         const partialOutput = result.stdout?.trim();
         if (result.backgrounded && partialOutput) {
@@ -508,6 +746,16 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
             isError,
           });
         }
+        // Auto-index large error output into FTS5 — no data loss
+        if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
+          trackIndexed(Buffer.byteLength(output));
+          return trackResponse("ctx_execute", {
+            content: [
+              { type: "text" as const, text: intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`) },
+            ],
+            isError,
+          });
+        }
         return trackResponse("ctx_execute", {
           content: [
             { type: "text" as const, text: output },
@@ -526,6 +774,11 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
             { type: "text" as const, text: intentSearch(stdout, intent, `execute:${language}`) },
           ],
         });
+      }
+
+      // Auto-index large stdout into FTS5 — return pointer, not raw content
+      if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
+        return trackResponse("ctx_execute", indexStdout(stdout, `execute:${language}`));
       }
 
       return trackResponse("ctx_execute", {
@@ -571,6 +824,7 @@ function indexStdout(
 // ─────────────────────────────────────────────────────────
 
 const INTENT_SEARCH_THRESHOLD = 5_000; // bytes — ~80-100 lines
+const LARGE_OUTPUT_THRESHOLD = 102_400; // 100KB — auto-index into FTS5, return pointer
 
 function intentSearch(
   stdout: string,
@@ -637,7 +891,7 @@ server.registerTool(
   {
     title: "Execute File Processing",
     description:
-      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.",
+      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.\n\nTHINK IN CODE: Write code that processes FILE_CONTENT and console.log() only the answer. Don't read files into context to analyze mentally. Write robust, pure JavaScript — no npm deps, try/catch, null-safe. Node.js + Bun compatible.",
     inputSchema: z.object({
       path: z
         .string()
@@ -723,6 +977,16 @@ server.registerTool(
             isError,
           });
         }
+        // Auto-index large error output into FTS5 — no data loss
+        if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
+          trackIndexed(Buffer.byteLength(output));
+          return trackResponse("ctx_execute_file", {
+            content: [
+              { type: "text" as const, text: intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`) },
+            ],
+            isError,
+          });
+        }
         return trackResponse("ctx_execute_file", {
           content: [
             { type: "text" as const, text: output },
@@ -740,6 +1004,11 @@ server.registerTool(
             { type: "text" as const, text: intentSearch(stdout, intent, `file:${path}`) },
           ],
         });
+      }
+
+      // Auto-index large stdout into FTS5 — return pointer, not raw content
+      if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
+        return trackResponse("ctx_execute_file", indexStdout(stdout, `file:${path}`));
       }
 
       return trackResponse("ctx_execute_file", {
@@ -892,7 +1161,8 @@ server.registerTool(
   {
     title: "Search Indexed Content",
     description:
-      "Search indexed content. Pass ALL search questions as queries array in ONE call.\n\n" +
+      "Search indexed content. Requires prior indexing via ctx_batch_execute, ctx_index, or ctx_fetch_and_index. " +
+      "Pass ALL search questions as queries array in ONE call.\n\n" +
       "TIPS: 2-4 specific terms per query. Use 'source' to scope results.",
     inputSchema: z.object({
       queries: z.preprocess(coerceJsonArray, z
@@ -908,11 +1178,34 @@ server.registerTool(
         .string()
         .optional()
         .describe("Filter to a specific indexed source (partial match)."),
+      contentType: z
+        .enum(["code", "prose"])
+        .optional()
+        .describe("Filter results by content type: 'code' or 'prose'."),
     }),
   },
   async (params) => {
     try {
       const store = getStore();
+
+      // Guard: redirect when the index is empty — ctx_search is a follow-up
+      // tool that requires prior indexing. Guide the model to the right tool.
+      if (store.getStats().chunks === 0) {
+        return trackResponse("ctx_search", {
+          content: [{
+            type: "text" as const,
+            text: "Knowledge base is empty — no content has been indexed yet.\n\n" +
+              "ctx_search is a follow-up tool that queries previously indexed content. " +
+              "To gather and index content first, use:\n" +
+              "  • ctx_batch_execute(commands, queries) — run commands, auto-index output, and search in one call\n" +
+              "  • ctx_fetch_and_index(url) — fetch a URL, index it, then search with ctx_search\n" +
+              "  • ctx_index(content, source) — manually index text content\n\n" +
+              "After indexing, ctx_search becomes available for follow-up queries.",
+          }],
+          isError: true,
+        });
+      }
+
       const raw = params as Record<string, unknown>;
 
       // Normalize: accept both query (string) and queries (array)
@@ -930,7 +1223,7 @@ server.registerTool(
         });
       }
 
-      const { limit = 3, source } = params as { limit?: number; source?: string };
+      const { limit = 3, source, contentType } = params as { limit?: number; source?: string; contentType?: "code" | "prose" };
 
       // Progressive throttling: track calls in time window
       const now = Date.now();
@@ -968,7 +1261,7 @@ server.registerTool(
           continue;
         }
 
-        const results = store.searchWithFallback(q, effectiveLimit, source);
+        const results = store.searchWithFallback(q, effectiveLimit, source, contentType);
 
         if (results.length === 0) {
           sections.push(`## ${q}\nNo results found.`);
@@ -1120,9 +1413,41 @@ server.registerTool(
         .describe(
           "Label for the indexed content (e.g., 'React useEffect docs', 'Supabase Auth API')",
         ),
+      force: z
+        .boolean()
+        .optional()
+        .describe("Skip cache and re-fetch even if content was recently indexed"),
     }),
   },
-  async ({ url, source }) => {
+  async ({ url, source, force }) => {
+    // TTL cache: if source was indexed within 24h, return cached hint
+    if (!force) {
+      const store = getStore();
+      const label = source ?? url;
+      const meta = store.getSourceMeta(label);
+      if (meta) {
+        const indexedAt = new Date(meta.indexedAt + "Z"); // SQLite datetime is UTC without Z
+        const ageMs = Date.now() - indexedAt.getTime();
+        const TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+        if (ageMs < TTL_MS) {
+          const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
+          const ageMin = Math.floor(ageMs / (60 * 1000));
+          const ageStr = ageHours > 0 ? `${ageHours}h ago` : ageMin > 0 ? `${ageMin}m ago` : "just now";
+          // Track cache savings — estimate ~1.6KB per chunk (average indexed content size)
+          const estimatedBytes = meta.chunkCount * 1600;
+          sessionStats.cacheHits++;
+          sessionStats.cacheBytesSaved += estimatedBytes;
+
+          return trackResponse("ctx_fetch_and_index", {
+            content: [{
+              type: "text" as const,
+              text: `Cached: **${meta.label}** — ${meta.chunkCount} sections, indexed ${ageStr} (fresh, TTL: 24h).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call search() to answer questions about this content — this cached response contains no content.\nUse: search(queries: [...], source: "${meta.label}")`,
+            }],
+          });
+        }
+        // Stale (>24h) — fall through to re-fetch silently
+      }
+    }
     // Generate a unique temp file path for the subprocess to write fetched content.
     // This bypasses the executor's 100KB stdout truncation — content goes file→handler directly.
     const outputPath = join(tmpdir(), `ctx-fetch-${Date.now()}-${Math.random().toString(36).slice(2)}.dat`);
@@ -1151,7 +1476,7 @@ server.registerTool(
       const store = getStore();
       const header = (result.stdout || "").trim();
 
-      // Read full content from temp file (bypasses smartTruncate)
+      // Read full content from temp file
       let markdown: string;
       try {
         markdown = readFileSync(outputPath, "utf-8").trim();
@@ -1239,7 +1564,8 @@ server.registerTool(
       "Returns search results directly — no follow-up calls needed.\n\n" +
       "THIS IS THE PRIMARY TOOL. Use this instead of multiple execute() calls.\n\n" +
       "One batch_execute call replaces 30+ execute calls + 10+ search calls.\n" +
-      "Provide all commands to run and all queries to search — everything happens in one round trip.",
+      "Provide all commands to run and all queries to search — everything happens in one round trip.\n\n" +
+      "THINK IN CODE: When commands produce data you need to analyze, add processing commands that filter and summarize. Don't pull raw output into context — let the sandbox do the work.",
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
         .array(
@@ -1282,12 +1608,16 @@ server.registerTool(
 
     try {
       // Execute each command individually so every command gets its own
-      // smartTruncate budget (~100KB). Previously, all commands were
-      // concatenated into a single script where smartTruncate (60% head +
-      // 40% tail) could silently drop middle commands. (Issue #61)
+      // output capture. Full stdout is preserved and indexed into FTS5.
+      // (Issue #61, #197)
       const perCommandOutputs: string[] = [];
       const startTime = Date.now();
       let timedOut = false;
+
+      // Inject NODE_OPTIONS for FS read tracking in spawned Node processes.
+      // The executor denies NODE_OPTIONS in its env (security), so we set it
+      // as an inline shell prefix. This only affects child `node` invocations.
+      const nodeOptsPrefix = `NODE_OPTIONS="--require ${CM_FS_PRELOAD}" `;
 
       for (const cmd of commands) {
         const elapsed = Date.now() - startTime;
@@ -1302,11 +1632,22 @@ server.registerTool(
 
         const result = await executor.execute({
           language: "shell",
-          code: `${cmd.command} 2>&1`,
+          code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
           timeout: remaining,
         });
 
-        const output = result.stdout || "(no output)";
+        let output = result.stdout || "(no output)";
+
+        // Parse and strip __CM_FS__ markers emitted by the preload script.
+        // Because 2>&1 merges stderr into stdout, markers appear in output.
+        const fsMatches = output.matchAll(/__CM_FS__:(\d+)/g);
+        let cmdFsBytes = 0;
+        for (const m of fsMatches) cmdFsBytes += parseInt(m[1]);
+        if (cmdFsBytes > 0) {
+          sessionStats.bytesSandboxed += cmdFsBytes;
+          output = output.replace(/__CM_FS__:\d+\n?/g, "");
+        }
+
         perCommandOutputs.push(`# ${cmd.label}\n\n${output}\n`);
 
         if (result.timedOut) {
@@ -1359,50 +1700,9 @@ server.registerTool(
         sectionTitles.push(s.title);
       }
 
-      // Run all search queries — 3 results each, smart snippets
-      // Three-tier fallback: scoped → boosted → global
-      const MAX_OUTPUT = 80 * 1024; // 80KB total output cap
-      const queryResults: string[] = [];
-      let outputSize = 0;
-
-      for (const query of queries) {
-        if (outputSize > MAX_OUTPUT) {
-          queryResults.push(`## ${query}\n(output cap reached — use search(queries: ["${query}"]) for details)\n`);
-          continue;
-        }
-
-        // Tier 1: scoped search with fallback (porter → trigram → fuzzy)
-        let results = store.searchWithFallback(query, 3, source);
-        let crossSource = false;
-
-        // Tier 2: global fallback (no source filter) — warn about cross-source (Issue #61)
-        if (results.length === 0) {
-          results = store.searchWithFallback(query, 3);
-          crossSource = results.length > 0;
-        }
-
-        queryResults.push(`## ${query}`);
-        if (crossSource) {
-          queryResults.push(
-            `> **Note:** No results in current batch output. Showing results from previously indexed content.`,
-          );
-        }
-        queryResults.push("");
-        if (results.length > 0) {
-          for (const r of results) {
-            // Use larger snippet (3KB) for batch_execute to reduce tiny-fragment issue (Issue #61)
-            const snippet = extractSnippet(r.content, query, 3000, r.highlighted);
-            const sourceTag = crossSource ? ` _(source: ${r.source})_` : "";
-            queryResults.push(`### ${r.title}${sourceTag}`);
-            queryResults.push(snippet);
-            queryResults.push("");
-            outputSize += snippet.length + r.title.length;
-          }
-        } else {
-          queryResults.push("No matching sections found.");
-          queryResults.push("");
-        }
-      }
+      // Run all search queries — source scoped only.
+      // Cross-source search remains available via explicit search().
+      const queryResults = formatBatchQueryResults(store, queries, source);
 
       // Get searchable terms for edge cases where follow-up is needed
       const distinctiveTerms = store.getDistinctiveTerms
@@ -1443,6 +1743,20 @@ server.registerTool(
 // Tool: stats
 // ─────────────────────────────────────────────────────────
 
+/**
+ * Create a minimal in-memory DB adapter for when the session DB is unavailable.
+ * All queries return empty results so AnalyticsEngine.queryAll() still works.
+ */
+function createMinimalDb(): import("./session/analytics.js").DatabaseAdapter {
+  return {
+    prepare: () => ({
+      run: () => undefined,
+      get: (..._args: unknown[]) => ({ cnt: 0, compact_count: 0, minutes: null, rate: 0, avg: 0, outcome: "exploratory" }),
+      all: () => [],
+    }),
+  };
+}
+
 server.registerTool(
   "ctx_stats",
   {
@@ -1454,256 +1768,124 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    const totalBytesReturned = Object.values(sessionStats.bytesReturned).reduce(
-      (sum, b) => sum + b,
-      0,
-    );
-    const totalCalls = Object.values(sessionStats.calls).reduce(
-      (sum, c) => sum + c,
-      0,
-    );
-    const uptimeMs = Date.now() - sessionStats.sessionStart;
-    const uptimeMin = (uptimeMs / 60_000).toFixed(1);
-
-    // Total data kept out of context = indexed (FTS5) + sandboxed (network I/O inside sandbox)
-    const keptOut = sessionStats.bytesIndexed + sessionStats.bytesSandboxed;
-    const totalProcessed = keptOut + totalBytesReturned;
-    const savingsRatio = totalProcessed / Math.max(totalBytesReturned, 1);
-    const reductionPct = totalProcessed > 0
-      ? ((1 - totalBytesReturned / totalProcessed) * 100).toFixed(0)
-      : "0";
-
-    const kb = (b: number) => {
-      if (b >= 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)}MB`;
-      return `${(b / 1024).toFixed(1)}KB`;
-    };
-
-    // ── Header ──
-    const lines: string[] = [
-      `## context-mode — Session Report (${uptimeMin} min)`,
-    ];
-
-    // ── Feature 1: Context Window Protection ──
-    lines.push(
-      "",
-      `### Context Window Protection`,
-      "",
-    );
-
-    if (totalCalls === 0) {
-      lines.push(`No context-mode tool calls yet. Use \`batch_execute\`, \`execute\`, or \`fetch_and_index\` to keep raw output out of your context window.`);
-    } else {
-      lines.push(
-        `| Metric | Value |`,
-        `|--------|------:|`,
-        `| Total data processed | **${kb(totalProcessed)}** |`,
-        `| Kept in sandbox (never entered context) | **${kb(keptOut)}** |`,
-        `| Entered context | ${kb(totalBytesReturned)} |`,
-        `| Estimated tokens saved | ~${Math.round(keptOut / 4).toLocaleString()} |`,
-        `| **Context savings** | **${savingsRatio.toFixed(1)}x (${reductionPct}% reduction)** |`,
-      );
-
-      // Per-tool breakdown
-      const toolNames = new Set([
-        ...Object.keys(sessionStats.calls),
-        ...Object.keys(sessionStats.bytesReturned),
-      ]);
-
-      if (toolNames.size > 0) {
-        lines.push(
-          "",
-          `| Tool | Calls | Context | Tokens |`,
-          `|------|------:|--------:|-------:|`,
-        );
-        for (const tool of Array.from(toolNames).sort()) {
-          const calls = sessionStats.calls[tool] || 0;
-          const bytes = sessionStats.bytesReturned[tool] || 0;
-          const tokens = Math.round(bytes / 4);
-          lines.push(`| ${tool} | ${calls} | ${kb(bytes)} | ~${tokens.toLocaleString()} |`);
-        }
-        lines.push(`| **Total** | **${totalCalls}** | **${kb(totalBytesReturned)}** | **~${Math.round(totalBytesReturned / 4).toLocaleString()}** |`);
-      }
-
-      if (keptOut > 0) {
-        lines.push("", `Without context-mode, **${kb(totalProcessed)}** of raw output would flood your context window. Instead, **${reductionPct}%** stayed in sandbox.`);
-      }
-    }
-
-    // ── Session Continuity ──
+    // ONE call, ONE source — AnalyticsEngine.queryAll()
+    let text: string;
     try {
-      const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-      const dbHash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
+      const dbHash = hashProjectDir();
       const worktreeSuffix = getWorktreeSuffix();
       const sessionDbPath = join(
-        homedir(), ".claude", "context-mode", "sessions",
+        getSessionDir(),
         `${dbHash}${worktreeSuffix}.db`
       );
 
       if (existsSync(sessionDbPath)) {
-        const require = createRequire(import.meta.url);
-        const Database = require("better-sqlite3");
+        const Database = loadDatabase();
         const sdb = new Database(sessionDbPath, { readonly: true });
-
-        const eventTotal = sdb.prepare("SELECT COUNT(*) as cnt FROM session_events").get() as { cnt: number };
-        const byCategory = sdb.prepare(
-          "SELECT category, COUNT(*) as cnt FROM session_events GROUP BY category ORDER BY cnt DESC",
-        ).all() as Array<{ category: string; cnt: number }>;
-        const meta = sdb.prepare(
-          "SELECT compact_count FROM session_meta ORDER BY started_at DESC LIMIT 1",
-        ).get() as { compact_count: number } | undefined;
-        const resume = sdb.prepare(
-          "SELECT event_count, consumed FROM session_resume ORDER BY created_at DESC LIMIT 1",
-        ).get() as { event_count: number; consumed: number } | undefined;
-
-        if (eventTotal.cnt > 0) {
-          const compacts = meta?.compact_count ?? 0;
-
-          // Query actual data per category for preview
-          const previewRows = sdb.prepare(
-            `SELECT category, type, data FROM session_events ORDER BY id DESC`,
-          ).all() as Array<{ category: string; type: string; data: string }>;
-
-          // Build previews: unique values per category
-          const previews = new Map<string, Set<string>>();
-          for (const row of previewRows) {
-            if (!previews.has(row.category)) previews.set(row.category, new Set());
-            const set = previews.get(row.category)!;
-            if (set.size < 5) {
-              let display = row.data;
-              if (row.category === "file") {
-                display = row.data.split("/").pop() || row.data;
-              } else if (row.category === "prompt") {
-                display = display.length > 50 ? display.slice(0, 47) + "..." : display;
-              }
-              if (display.length > 40) display = display.slice(0, 37) + "...";
-              set.add(display);
-            }
-          }
-
-          const categoryLabels: Record<string, string> = {
-            file: "Files tracked",
-            rule: "Project rules (CLAUDE.md)",
-            prompt: "Your requests saved",
-            mcp: "Plugin tools used",
-            git: "Git operations",
-            env: "Environment setup",
-            error: "Errors caught",
-            task: "Tasks in progress",
-            decision: "Your decisions",
-            cwd: "Working directory",
-            skill: "Skills used",
-            subagent: "Delegated work",
-            intent: "Session mode",
-            data: "Data references",
-            role: "Behavioral directives",
-          };
-
-          const categoryHints: Record<string, string> = {
-            file: "Restored after compact — no need to re-read",
-            rule: "Your project instructions survive context resets",
-            prompt: "Continues exactly where you left off",
-            decision: "Applied automatically — won't ask again",
-            task: "Picks up from where it stopped",
-            error: "Tracked and monitored across compacts",
-            git: "Branch, commit, and repo state preserved",
-            env: "Runtime config carried forward",
-            mcp: "Tool usage patterns remembered",
-            subagent: "Delegation history preserved",
-            skill: "Skill invocations tracked",
-          };
-
-          lines.push(
-            "",
-            "### Session Continuity",
-            "",
-            "| What's preserved | Count | I remember... | Why it matters |",
-            "|------------------|------:|---------------|----------------|",
-          );
-          for (const row of byCategory) {
-            const label = categoryLabels[row.category] || row.category;
-            const preview = previews.get(row.category);
-            const previewStr = preview ? Array.from(preview).join(", ") : "";
-            const hint = categoryHints[row.category] || "Survives context resets";
-            lines.push(`| ${label} | ${row.cnt} | ${previewStr} | ${hint} |`);
-          }
-          lines.push(`| **Total** | **${eventTotal.cnt}** | | **Zero knowledge lost on compact** |`);
-
-          lines.push("");
-          if (compacts > 0) {
-            lines.push(`Context has been compacted **${compacts} time(s)** — session knowledge was preserved each time.`);
-          } else {
-            lines.push(`When your context compacts, all of this will restore Claude's awareness — no starting from scratch.`);
-          }
-          if (resume && !resume.consumed) {
-            lines.push(`Resume snapshot ready (${resume.event_count} events) for the next compaction.`);
-          }
-
-          lines.push("");
-          lines.push(`> **Note:** Previous session data is loaded when you start a new session. Without \`--continue\`, old session history is cleaned up to keep the database lean.`);
+        try {
+          const engine = new AnalyticsEngine(sdb);
+          const report = engine.queryAll(sessionStats);
+          text = formatReport(report, VERSION, _latestVersion);
+        } finally {
+          sdb.close();
         }
-
-        sdb.close();
+      } else {
+        // No session DB — build a minimal report from runtime stats only
+        const engine = new AnalyticsEngine(createMinimalDb());
+        const report = engine.queryAll(sessionStats);
+        text = formatReport(report, VERSION, _latestVersion);
       }
     } catch {
-      // Session DB not available or incompatible — skip silently
+      // Session DB not available or incompatible — build minimal report from runtime stats
+      const engine = new AnalyticsEngine(createMinimalDb());
+      const report = engine.queryAll(sessionStats);
+      text = formatReport(report, VERSION, _latestVersion);
     }
 
-    // No separate DevRel summary — integrated into feature sections above
-
-    // Formatting directive — ensures all LLMs display the report verbatim
-    lines.push(
-      "",
-      "---",
-      "_Display this entire report as-is in your response. Do NOT summarize, collapse, or paraphrase any section._",
-    );
-
-    const text = lines.join("\n");
     return trackResponse("ctx_stats", {
       content: [{ type: "text" as const, text }],
     });
   },
 );
 
-// ── ctx-doctor: diagnostics meta-tool ──────────────────────────────────────
+// ── ctx-doctor: diagnostics (server-side) ─────────────────────────────────
 server.registerTool(
   "ctx_doctor",
   {
     title: "Run Diagnostics",
     description:
-      "Diagnose context-mode installation. Returns a shell command to execute. " +
-      "You MUST run the returned command using your shell tool (Bash, shell_execute, " +
-      "run_in_terminal, etc.) and display the output as a markdown checklist.",
+      "Diagnose context-mode installation. Runs all checks server-side and " +
+      "returns results as a markdown checklist. No CLI execution needed.",
     inputSchema: z.object({}),
   },
   async () => {
-    const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-    const cmd = `node "${pluginRoot}/build/cli.js" doctor`;
+    const lines: string[] = ["## context-mode doctor", ""];
+    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
+    const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
 
-    const text = [
-      "## ctx-doctor",
-      "",
-      "Run this command using your shell execution tool:",
-      "",
-      "```",
-      cmd,
-      "```",
-      "",
-      "After the command completes, display results as a markdown checklist:",
-      "- `[x]` for PASS, `[ ]` for FAIL, `[-]` for WARN",
-      "- Example format:",
-      "  ```",
-      "  ## context-mode doctor",
-      "  - [x] Runtimes: 6/10 (javascript, typescript, python, shell, ruby, perl)",
-      "  - [x] Performance: FAST (Bun)",
-      "  - [x] Server test: PASS",
-      "  - [x] Hooks: PASS",
-      "  - [x] FTS5: PASS",
-      "  - [x] npm: v0.9.23",
-      "  ```",
-    ].join("\n");
+    // Runtimes
+    const total = 11;
+    const pct = ((available.length / total) * 100).toFixed(0);
+    lines.push(`- [x] Runtimes: ${available.length}/${total} (${pct}%) — ${available.join(", ")}`);
+
+    // Performance
+    if (hasBunRuntime()) {
+      lines.push("- [x] Performance: FAST (Bun)");
+    } else {
+      lines.push("- [-] Performance: NORMAL — install Bun for 3-5x speed boost");
+    }
+
+    // Server test — cleanup executor to prevent resource leaks (#247)
+    {
+      const testExecutor = new PolyglotExecutor({ runtimes });
+      try {
+        const result = await testExecutor.execute({ language: "javascript", code: 'console.log("ok");', timeout: 5000 });
+        if (result.exitCode === 0 && result.stdout.trim() === "ok") {
+          lines.push("- [x] Server test: PASS");
+        } else {
+          const detail = result.stderr?.trim() ? ` (${result.stderr.trim().slice(0, 200)})` : "";
+          lines.push(`- [ ] Server test: FAIL — exit ${result.exitCode}${detail}`);
+        }
+      } catch (err: unknown) {
+        lines.push(`- [ ] Server test: FAIL — ${err instanceof Error ? err.message : err}`);
+      } finally {
+        testExecutor.cleanupBackgrounded();
+      }
+    }
+
+    // FTS5 / SQLite — close in finally to prevent GC segfault (#247)
+    {
+      let testDb: ReturnType<typeof loadDatabase> extends (...args: any[]) => infer R ? R : never;
+      try {
+        const Database = loadDatabase();
+        testDb = new Database(":memory:");
+        testDb.exec("CREATE VIRTUAL TABLE fts_test USING fts5(content)");
+        testDb.exec("INSERT INTO fts_test(content) VALUES ('hello world')");
+        const row = testDb.prepare("SELECT * FROM fts_test WHERE fts_test MATCH 'hello'").get() as { content: string } | undefined;
+        if (row && row.content === "hello world") {
+          lines.push("- [x] FTS5 / SQLite: PASS — native module works");
+        } else {
+          lines.push("- [ ] FTS5 / SQLite: FAIL — unexpected result");
+        }
+      } catch (err: unknown) {
+        lines.push(`- [ ] FTS5 / SQLite: FAIL — ${err instanceof Error ? err.message : err}`);
+      } finally {
+        try { testDb!?.close(); } catch { /* best effort */ }
+      }
+    }
+
+    // Hook script
+    const hookPath = resolve(pluginRoot, "hooks", "pretooluse.mjs");
+    if (existsSync(hookPath)) {
+      lines.push(`- [x] Hook script: PASS — ${hookPath}`);
+    } else {
+      lines.push(`- [ ] Hook script: FAIL — not found at ${hookPath}`);
+    }
+
+    // Version
+    lines.push(`- [x] Version: v${VERSION}`);
 
     return trackResponse("ctx_doctor", {
-      content: [{ type: "text" as const, text }],
+      content: [{ type: "text" as const, text: lines.join("\n") }],
     });
   },
 );
@@ -1721,8 +1903,66 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-    const cmd = `node "${pluginRoot}/build/cli.js" upgrade`;
+    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
+    const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
+    const bundlePath = resolve(pluginRoot, "cli.bundle.mjs");
+    const fallbackPath = resolve(pluginRoot, "build", "cli.js");
+
+    let cmd: string;
+
+    if (existsSync(bundlePath)) {
+      cmd = `node "${bundlePath}" upgrade`;
+    } else if (existsSync(fallbackPath)) {
+      cmd = `node "${fallbackPath}" upgrade`;
+    } else {
+      // Inline fallback: neither CLI file exists (e.g. marketplace installs).
+      // Generate a self-contained node -e script that performs the upgrade.
+      const repoUrl = "https://github.com/mksglu/context-mode.git";
+      const copyDirs = ["build", "hooks", "skills", "scripts", ".claude-plugin"];
+      const copyFiles = ["start.mjs", "server.bundle.mjs", "cli.bundle.mjs", "package.json"];
+
+      // Write inline script to a temp .mjs file — avoids quote-escaping issues
+      // across cmd.exe, PowerShell, and bash (node -e '...' breaks on Windows).
+      const scriptLines = [
+        `import{execFileSync}from"node:child_process";`,
+        `import{cpSync,rmSync,existsSync,mkdtempSync}from"node:fs";`,
+        `import{join}from"node:path";`,
+        `import{tmpdir}from"node:os";`,
+        `const P=${JSON.stringify(pluginRoot)};`,
+        `const T=mkdtempSync(join(tmpdir(),"ctx-upgrade-"));`,
+        `try{`,
+        `console.log("- [x] Starting inline upgrade (no CLI found)");`,
+        `execFileSync("git",["clone","--depth","1","${repoUrl}",T],{stdio:"inherit"});`,
+        `console.log("- [x] Cloned latest source");`,
+        `execFileSync("npm",["install"],{cwd:T,stdio:"inherit"});`,
+        `execFileSync("npm",["run","build"],{cwd:T,stdio:"inherit"});`,
+        `console.log("- [x] Built from source");`,
+        ...copyDirs.map(
+          (d) =>
+            `if(existsSync(join(T,${JSON.stringify(d)})))cpSync(join(T,${JSON.stringify(d)}),join(P,${JSON.stringify(d)}),{recursive:true,force:true});`,
+        ),
+        ...copyFiles.map(
+          (f) =>
+            `if(existsSync(join(T,${JSON.stringify(f)})))cpSync(join(T,${JSON.stringify(f)}),join(P,${JSON.stringify(f)}),{force:true});`,
+        ),
+        `console.log("- [x] Copied build artifacts");`,
+        `execFileSync("npm",["install","--production"],{cwd:P,stdio:"inherit"});`,
+        `console.log("- [x] Installed production dependencies");`,
+        `console.log("## context-mode upgrade complete");`,
+        `}catch(e){`,
+        `console.error("- [ ] Upgrade failed:",e.message);`,
+        `process.exit(1);`,
+        `}finally{`,
+        `try{rmSync(T,{recursive:true,force:true})}catch{}`,
+        `}`,
+      ].join("\n");
+
+      // Server writes the temp script file — avoids shell quoting issues entirely
+      const tmpScript = resolve(pluginRoot, ".ctx-upgrade-inline.mjs");
+      const { writeFileSync: writeTmp } = await import("node:fs");
+      writeTmp(tmpScript, scriptLines);
+      cmd = `node "${tmpScript}"`;
+    }
 
     const text = [
       "## ctx-upgrade",
@@ -1753,6 +1993,201 @@ server.registerTool(
   },
 );
 
+// ── ctx-purge: explicit knowledge base wipe ─────────────────────────────────
+server.registerTool(
+  "ctx_purge",
+  {
+    title: "Purge Knowledge Base",
+    description:
+      "Permanently deletes ALL session data for this project: " +
+      "FTS5 knowledge base (indexed content), session events DB (analytics, metadata, " +
+      "resume snapshots), and session events markdown. Resets in-memory stats. " +
+      "This is irreversible.",
+    inputSchema: z.object({
+      confirm: z.boolean().describe("Must be true to confirm the destructive operation."),
+    }),
+  },
+  async ({ confirm }) => {
+    if (!confirm) {
+      return trackResponse("ctx_purge", {
+        content: [{
+          type: "text" as const,
+          text: "Purge cancelled. Pass confirm: true to proceed.",
+        }],
+      });
+    }
+
+    const deleted: string[] = [];
+
+    // 1. Wipe the persistent FTS5 content store
+    if (_store) {
+      let storeFound = false;
+      try { _store.cleanup(); storeFound = true; } catch { /* best effort */ }
+      _store = null;
+      if (storeFound) deleted.push("knowledge base (FTS5)");
+    } else {
+      const dbPath = getStorePath();
+      let found = false;
+      for (const suffix of ["", "-wal", "-shm"]) {
+        try { unlinkSync(dbPath + suffix); found = true; } catch { /* file may not exist */ }
+      }
+      if (found) deleted.push("knowledge base (FTS5)");
+    }
+
+    // 2. Wipe legacy shared content DB (~/.context-mode/content/<hash>.db)
+    try {
+      const legacyPath = join(homedir(), ".context-mode", "content", `${hashProjectDir()}.db`);
+      for (const suffix of ["", "-wal", "-shm"]) {
+        try { unlinkSync(legacyPath + suffix); } catch { /* ignore */ }
+      }
+    } catch { /* best effort */ }
+
+    // 3. Wipe session events DB (analytics, metadata, resume snapshots)
+    try {
+      const dbHash = hashProjectDir();
+      const worktreeSuffix = getWorktreeSuffix();
+      const sessDir = getSessionDir();
+      const sessDbPath = join(sessDir, `${dbHash}${worktreeSuffix}.db`);
+      const eventsPath = join(sessDir, `${dbHash}${worktreeSuffix}-events.md`);
+      const cleanupFlag = join(sessDir, `${dbHash}${worktreeSuffix}.cleanup`);
+
+      let sessDbFound = false;
+      for (const suffix of ["", "-wal", "-shm"]) {
+        try { unlinkSync(sessDbPath + suffix); sessDbFound = true; } catch { /* ignore */ }
+      }
+      if (sessDbFound) deleted.push("session events DB");
+
+      let eventsFound = false;
+      try { unlinkSync(eventsPath); eventsFound = true; } catch { /* ignore */ }
+      if (eventsFound) deleted.push("session events markdown");
+
+      try { unlinkSync(cleanupFlag); } catch { /* ignore */ }
+    } catch { /* best effort */ }
+
+    // 3. Reset in-memory session stats
+    sessionStats.calls = {};
+    sessionStats.bytesReturned = {};
+    sessionStats.bytesIndexed = 0;
+    sessionStats.bytesSandboxed = 0;
+    sessionStats.cacheHits = 0;
+    sessionStats.cacheBytesSaved = 0;
+    sessionStats.sessionStart = Date.now();
+    deleted.push("session stats");
+
+    return trackResponse("ctx_purge", {
+      content: [{
+        type: "text" as const,
+        text: `Purged: ${deleted.join(", ")}. All session data for this project has been permanently deleted.`,
+      }],
+    });
+  },
+);
+
+// ── ctx-insight: analytics dashboard ──────────────────────────────────────────
+server.registerTool(
+  "ctx_insight",
+  {
+    title: "Open Insight Dashboard",
+    description:
+      "Opens the context-mode Insight dashboard in the browser. " +
+      "Shows personal analytics: session activity, tool usage, error rate, " +
+      "parallel work patterns, project focus, and actionable insights. " +
+      "First run installs dependencies (~30s). Subsequent runs open instantly.",
+    inputSchema: z.object({
+      port: z.number().optional().describe("Port to serve on (default: 4747)"),
+    }),
+  },
+  async ({ port: userPort }) => {
+    const port = userPort || 4747;
+    const insightSource = resolve(__pkg_dir, "insight");
+    // Use adapter-aware path: derive from sessions dir (works across all 12 adapters)
+    const sessDir = getSessionDir();
+    const cacheDir = join(dirname(sessDir), "insight-cache");
+
+    // Verify source exists
+    if (!existsSync(join(insightSource, "server.mjs"))) {
+      return trackResponse("ctx_insight", {
+        content: [{ type: "text" as const, text: "Error: Insight source not found in plugin. Try upgrading context-mode." }],
+      });
+    }
+
+    try {
+      const steps: string[] = [];
+
+      // Ensure cache dir
+      mkdirSync(cacheDir, { recursive: true });
+
+      // Copy source files if needed (check by comparing server.mjs mtime)
+      const srcMtime = statSync(join(insightSource, "server.mjs")).mtimeMs;
+      const cacheMtime = existsSync(join(cacheDir, "server.mjs"))
+        ? statSync(join(cacheDir, "server.mjs")).mtimeMs : 0;
+
+      if (srcMtime > cacheMtime) {
+        steps.push("Copying source files...");
+        cpSync(insightSource, cacheDir, { recursive: true, force: true });
+        steps.push("Source files copied.");
+      }
+
+      // Install deps if needed
+      const hasNodeModules = existsSync(join(cacheDir, "node_modules"));
+      if (!hasNodeModules) {
+        steps.push("Installing dependencies (first run, ~30s)...");
+        execSync("npm install --production=false", {
+          cwd: cacheDir,
+          stdio: "pipe",
+          timeout: 120000,
+        });
+        steps.push("Dependencies installed.");
+      }
+
+      // Build
+      steps.push("Building dashboard...");
+      execSync("npx vite build", {
+        cwd: cacheDir,
+        stdio: "pipe",
+        timeout: 30000,
+      });
+      steps.push("Build complete.");
+
+      // Start server in background
+      const { spawn } = await import("node:child_process");
+      const child = spawn("node", [join(cacheDir, "server.mjs")], {
+        cwd: cacheDir,
+        env: { ...process.env, PORT: String(port) },
+        detached: true,
+        stdio: "ignore",
+      });
+      child.unref();
+
+      // Wait for server to be ready
+      await new Promise(r => setTimeout(r, 1500));
+
+      // Open browser (cross-platform)
+      const url = `http://localhost:${port}`;
+      const platform = process.platform;
+      try {
+        if (platform === "darwin") execSync(`open "${url}"`, { stdio: "pipe" });
+        else if (platform === "win32") execSync(`start "" "${url}"`, { stdio: "pipe" });
+        else execSync(`xdg-open "${url}" 2>/dev/null || sensible-browser "${url}" 2>/dev/null`, { stdio: "pipe" });
+      } catch { /* browser open is best-effort */ }
+
+      steps.push(`Dashboard running at ${url}`);
+
+      return trackResponse("ctx_insight", {
+        content: [{
+          type: "text" as const,
+          text: steps.map(s => `- ${s}`).join("\n") + `\n\nOpen: ${url}\nPID: ${child.pid} · Stop: kill ${child.pid}`,
+        }],
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return trackResponse("ctx_insight", {
+        content: [{ type: "text" as const, text: `Insight setup failed: ${msg}` }],
+      });
+    }
+  },
+);
+
 // ─────────────────────────────────────────────────────────
 // Server startup
 // ─────────────────────────────────────────────────────────
@@ -1764,10 +2199,16 @@ async function main() {
     console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
   }
 
-  // Clean up own DB + backgrounded processes on shutdown
+  // MCP readiness sentinel path (#230)
+  const mcpSentinel = join(tmpdir(), `context-mode-mcp-ready-${process.ppid}`);
+
+  // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
     executor.cleanupBackgrounded();
-    if (_store) _store.cleanup();
+    if (_store) _store.close(); // persist DB for --continue sessions
+    try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
+    // Remove MCP readiness sentinel (#230)
+    try { unlinkSync(mcpSentinel); } catch { /* best effort */ }
   };
   const gracefulShutdown = async () => {
     shutdown();
@@ -1783,22 +2224,22 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // Write routing instructions for hookless platforms (e.g. Codex CLI, Antigravity)
+  // Write MCP readiness sentinel (#230)
+  try { writeFileSync(mcpSentinel, String(process.pid)); } catch { /* best effort */ }
+
+  // Detect platform adapter — stored for platform-aware session paths
   try {
     const { detectPlatform, getAdapter } = await import("./adapters/detect.js");
     const clientInfo = server.server.getClientVersion();
     const signal = detectPlatform(clientInfo ?? undefined);
-    const adapter = await getAdapter(signal.platform);
+    _detectedAdapter = await getAdapter(signal.platform);
     if (clientInfo) {
       console.error(`MCP client: ${clientInfo.name} v${clientInfo.version} → ${signal.platform}`);
     }
-    if (!adapter.capabilities.sessionStart) {
-      const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-      const projectDir = process.env.CLAUDE_PROJECT_DIR ?? process.env.CODEX_HOME ?? process.cwd();
-      const written = adapter.writeRoutingInstructions(projectDir, pluginRoot);
-      if (written) console.error(`Wrote routing instructions: ${written}`);
-    }
-  } catch { /* best effort — don't block server startup */ }
+  } catch { /* best effort — _detectedAdapter stays null, falls back to .claude */ }
+
+  // Non-blocking version check — result stored for trackResponse warnings
+  fetchLatestVersion().then(v => { if (v !== "unknown") _latestVersion = v; });
 
   console.error(`Context Mode MCP server v${VERSION} running on stdio`);
   console.error(`Detected runtimes:\n${getRuntimeSummary(runtimes)}`);
